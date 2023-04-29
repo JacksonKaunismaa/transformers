@@ -69,11 +69,11 @@ class Encoder():  # or should it be called tokenizer
 
     def get_bigrams(self, token):  # token in the sense of "something having come from self.pat" + merging steps
         return set(zip(token, token[1:]))
-    
+
     def bpe_merge(self, token):
         if token in self.cache:  # check cache first
             return self.cache[token]
-        
+
         curr_token = list(token)  # we only do the string->list thing so the cache works
 
         while len(curr_token) > 1:  # if it's merged to a single token, we are done anyway
@@ -104,7 +104,7 @@ class Encoder():  # or should it be called tokenizer
                 break
         self.cache[token] = curr_token
         return curr_token
-    
+
     def encode(self, text):
         try:
             tokens = re.findall(self.pat, text)
@@ -122,12 +122,12 @@ class Encoder():  # or should it be called tokenizer
             idx_tok = [self.tok_to_idx[t] for t in bpe_tok]
             idx_list += idx_tok
         return idx_list
-    
+
     def process_one(self, text):
         enc_tokens = self.encode(text)
         enc_tokens.append(self.eos_token)
         return np.asarray(enc_tokens, dtype=np.uint16)
-    
+
     def encode_file_list(self, out_fname, in_fnames):
         all_lines = []
         for fname in in_fnames:
@@ -141,7 +141,7 @@ class Encoder():  # or should it be called tokenizer
         #enc_lines = [self.encode(line) for line in tqdm(all_lines)]
         self.write_file(out_fname, enc_lines)
 
-    
+
     def write_file(self, out_fname, enc_lines):
         print("Calculating size...")
         size = sum([e.shape[0] for e in tqdm(enc_lines)])
@@ -163,7 +163,7 @@ class Encoder():  # or should it be called tokenizer
             text += text_tok
         # print(text)
         return "".join(text)
-    
+
 
 class TextDataset(Dataset):
     def __init__(self, fname):
@@ -183,7 +183,7 @@ class TextDataset(Dataset):
 
 
     def __getitem__(self, idx):
-        
+
         text = self.strings[idx]
         indices = self.encoder.encode(text)
         indices = torch.tensor(indices, dtype=torch.uint16)
@@ -192,19 +192,19 @@ class TextDataset(Dataset):
         # targets = indices[1:]
 
         return indices  # do that in collate_fn instead
-    
+
     def __len__(self):
         return len(self.strings)
-    
+
 
 def get_encoder():
     # use openai token_to_idx and bpe_merge
     download_remote("https://openaipublic.blob.core.windows.net/gpt-2/models/124M/encoder.json", "encoder.json")
     download_remote("https://openaipublic.blob.core.windows.net/gpt-2/models/124M/vocab.bpe", "vocab.bpe")
-    
+
     with open("encoder.json", "r") as f:
         token_to_idx = json.load(f)
     with open("vocab.bpe", "r") as f:
         bpe_merge_list = [tuple(x.strip().split()) for x in f.readlines()]
-    
+
     return Encoder(token_to_idx, bpe_merge_list[1:-1])

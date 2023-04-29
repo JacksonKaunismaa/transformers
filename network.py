@@ -13,7 +13,7 @@ class MLPBlock(nn.Module):
     def forward(self, x):
         # x -> (batch, seq_len, vec_size)
         return self.w_2(self.act_func1(self.w_1(x)))
-    
+
 class MultiHeadAttention(nn.Module):
     def __init__(self, vec_size, n_heads, block_size):
         super().__init__()
@@ -31,7 +31,7 @@ class MultiHeadAttention(nn.Module):
 
         # lower left triangle (rows = correspond to given location, left/right within a row (cols) = where we are attending to)
         # register_buffer = untrainable parameter, but gets moved onto/off GPU as requested when doing model.to()
-        self.register_buffer("causal_mask", 
+        self.register_buffer("causal_mask",
                              torch.tril(torch.ones(block_size, block_size)).reshape(1,1, block_size, block_size))
 
 
@@ -44,7 +44,7 @@ class MultiHeadAttention(nn.Module):
 
         # q is (batch, n_heads, seq_len, head_size) and k is (batch, n_heads, head_size, seq_len)
         attn_dots = q.transpose(1,2) @ k.transpose(1,2).transpose(2,3)  # attn_dots is (batch, n_heads, seq_len, seq_len)
-        
+
         # mask out the future
         causal_attn = attn_dots.masked_fill(self.causal_mask[..., :seq_len, :seq_len], -float("inf"))
 
@@ -55,21 +55,21 @@ class MultiHeadAttention(nn.Module):
 
         out = self.out(attn.transpose(1,2).reshape(batch, seq_len, self.vec_size))  # (batch, seq_len, vec_size)
         return self.out_dropout(out)
-    
+
 class TransformerBlock():
     def __init__(self, vec_size, n_heads, block_size):
         super().__init__()
         self.ln1 = nn.LayerNorm(vec_size)
         self.mha = MultiHeadAttention(vec_size, n_heads, block_size)
         self.ln2 = nn.LayerNorm(vec_size)
-        self.mlp = MLPBlock(vec_size)  
+        self.mlp = MLPBlock(vec_size)
         self.embed_dropout = nn.Dropout(p=0.1)
-    
+
     def forward(self, x):
         x = x + self.ln1(self.mha(x))
         x = x + self.ln2(self.mlp(x))
         return x
-    
+
 class Transformer(nn.Module):
     def __init__(self, vocab_size, n_layer, vec_size, n_heads, block_size):
         super().__init__()
