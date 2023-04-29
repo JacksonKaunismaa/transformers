@@ -60,7 +60,7 @@ def train(net, optimizer, loss, epochs, train_loader, valid_loader, device=None)
         va_losses.append(epoch_va_loss)
         tr_losses.append(epoch_tr_loss)
         va_accuracies.append(epoch_va_accuracy)
-        
+
     return va_losses, va_accuracies, tr_losses
 
 
