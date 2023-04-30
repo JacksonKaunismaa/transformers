@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from os import path as osp
 
 class MLPBlock(nn.Module):
     def __init__(self, vec_size):
@@ -65,13 +66,18 @@ class TransformerBlock():
         self.mlp = MLPBlock(vec_size)
         self.embed_dropout = nn.Dropout(p=0.1)
 
-    def forward(self, x):
+    def forward(self, x):  
+        # this is not Pre-LN nor Post-LN (Pre-LN would be x + self.mha(self.ln1(x)))
+        # however, it seems like it might have the same properties, since norms of the residual stream will be increasing
+        # with depth. The actual minGPT repo, upon which this is inspired, does mha(ln(x)), which is the actual Pre-LN,
+        # but I'm curious how this performs, so I'll leave it for now. It feels like it kinda defeats the point of LN,
+        # which is supposed to keep the distributions input into a given layer typical, but who knows.
         x = x + self.ln1(self.mha(x))
         x = x + self.ln2(self.mlp(x))
         return x
 
 class Transformer(nn.Module):
-    def __init__(self, vocab_size, n_layer, vec_size, n_heads, block_size):
+    def __init__(self, vocab_size, n_layer, vec_size, n_heads, block_size, save_name):
         super().__init__()
 
         self.embed = nn.Embedding(vocab_size, vec_size)
@@ -80,6 +86,10 @@ class Transformer(nn.Module):
         self.blocks = nn.ModuleList([TransformerBlock(vec_size, n_heads, block_size) for _ in range(n_layer)])
 
         self.unembed = nn.Linear(vec_size, vocab_size)
+
+        # for saving stuff purposes
+        self.save_name = save_name
+        self.best_loss = float('inf')
 
     def forward(self, x, logits=False):
         _, seq_len = x.shape
@@ -91,3 +101,35 @@ class Transformer(nn.Module):
         if logits:
             return y
         return F.softmax(y, dim=-1)
+    
+    def save_model_state_dict(self, path=None, optim=None):
+        if path is None:
+            path = self.path
+        path = osp.join("models", path)
+        save_dict = {}
+        if optim is not None:
+            save_dict["optim"] = optim.state_dict()
+        save_dict["model"] = self.state_dict()
+        save_dict["best_loss"] = self.best_loss
+        torch.save(save_dict, path)
+
+    def load_model_state_dict(self, path=None, optim=None):
+        if path is None:
+            path = self.path
+        path = osp.join("models", path)
+        if not osp.exists(path):
+            print("No existing model found", path)
+            return
+        print("Found path of", path)
+        load_dict = torch.load(path)
+        if optim is not None:
+            try:
+                optim.load_state_dict(load_dict["optim"])
+            except KeyError:
+                print("Optimizer state not found!")
+        self.load_state_dict(load_dict["model"])
+        self.best_loss = load_dict["best_loss"]
+        
+
+
+

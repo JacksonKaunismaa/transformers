@@ -163,15 +163,36 @@ class Encoder():  # or should it be called tokenizer
             text += text_tok
         # print(text)
         return "".join(text)
+    
 
-
-class TextDataset(Dataset):
-    def __init__(self, fname):
-        data = np.memmap(fname, dtype=np.uint16, mode="r")
+class IdxDataset(Dataset):  # this feels like it shouldn't work... (has to learn to ignore all context before EOS)
+    def __init__(self, fname, block_size, data_size, chunk_size):
+        self.data = np.memmap(fname, dtype=np.uint16, mode="r", shape=(data_size,))
         self.encoder = get_encoder()
-        vocab_size = len(self.encoder.tok_to_idx)
-        self.pad_token = vocab_size
-        self.vocab_size = vocab_size + 1  # including pad token
+        self.vocab_size = len(self.encoder.idx_to_tok)
+        self.block_size = block_size
+        # how finegrained to split the dataset. sequences are sampled from the beginning of chunks,
+        # each of which are chunksize in size. Also defines the len of the Dataset
+        self.chunk_size = chunk_size
+
+    def __len__(self):
+        return (self.data.shape[0] - self.block_size - 1) // self.chunk_size
+
+    def __getitem__(self, idx):
+        data_idx = idx*self.chunk_size
+        # due to the way len is defined, this shouldnt hit any IndexErrors
+        x = torch.tensor(self.data[data_idx : data_idx+self.block_size], dtype=torch.uint16)
+        y = torch.tensor(self.data[data_idx+1 : data_idx+self.block_size+1], dtype=torch.uint16)
+        # position indices, assuming that x[0] is position 0, resetting any time we hit an EOS
+        # seems like you could also store the actual positions in the dataset, and have it not start x[0] being at posn 0
+        #posn = 
+        return x, y
+
+
+class TextDataset(Dataset):   # this gives batches with LOTS of padding
+    def __init__(self, fname):
+        self.encoder = get_encoder()
+        self.vocab_size = len(self.encoder.idx_to_tok)
 
     def collate_fn(self, samples):
         # 0 maps to ! for now 
