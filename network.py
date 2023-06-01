@@ -1,39 +1,48 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 from os import path as osp
+import config_objects
+
+
+def get_lr(curr_lr, step, cfg: config_objects.ModelCfg):  # Cosine annealing with warmup
+    if step < cfg.t_warmup:
+        return step / cfg.t_warmup * cfg.lr_max
+    
+
 
 class MLPBlock(nn.Module):
-    def __init__(self, vec_size):
+    def __init__(self, cfg):
         super().__init__()
-        self.w_1 = nn.Linear(vec_size, vec_size*4)
+        self.w_1 = nn.Linear(cfg.vec_size, cfg.vec_size*4)
         self.act_func1 = nn.GELU()
-        self.w_2 = nn.Linear(vec_size*4, vec_size)
-        self.dropout = nn.Dropout(p=0.1)
+        self.w_2 = nn.Linear(cfg.vec_size*4, cfg.vec_size)
+        self.dropout = nn.Dropout(p=cfg.mlp_dropout)
 
     def forward(self, x):
         # x -> (batch, seq_len, vec_size)
         return self.w_2(self.act_func1(self.w_1(x)))
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, vec_size, n_heads, block_size):
+    def __init__(self, cfg):
         super().__init__()
-        assert vec_size % n_heads == 0
+        assert cfg.vec_size % cfg.n_heads == 0
 
-        self.vec_size = vec_size
-        self.n_heads = n_heads
-        self.head_size = vec_size//n_heads
+        self.vec_size = cfg.vec_size
+        self.n_heads = cfg.n_heads
+        self.head_size = cfg.vec_size // cfg.n_heads
 
         self.qkv = nn.Linear(self.head_size, 3*self.head_size, bias=False)
         self.out = nn.Linear(self.vec_size, self.vec_size, bias=False)
 
-        self.attn_dropout = nn.Dropout(p=0.1)
-        self.out_dropout = nn.Dropout(p=0.1)
+        self.attn_dropout = nn.Dropout(p=cfg.attn_dropout)
+        self.out_dropout = nn.Dropout(p=cfg.out_dropout)
 
         # lower left triangle (rows = correspond to given location, left/right within a row (cols) = where we are attending to)
         # register_buffer = untrainable parameter, but gets moved onto/off GPU as requested when doing model.to()
         self.register_buffer("causal_mask",
-                             torch.tril(torch.ones(block_size, block_size)).reshape(1,1, block_size, block_size))
+                             torch.tril(torch.ones(cfg.block_size, cfg.block_size)).reshape(1,1, cfg.block_size, cfg.block_size))
 
 
     def forward(self, x):
@@ -58,13 +67,13 @@ class MultiHeadAttention(nn.Module):
         return self.out_dropout(out)
 
 class TransformerBlock():
-    def __init__(self, vec_size, n_heads, block_size):
+    def __init__(self, cfg):
+        # design pattern: never pass in parameters directly into initializing a nn.Module, always use the cfg object
         super().__init__()
-        self.ln1 = nn.LayerNorm(vec_size)
-        self.mha = MultiHeadAttention(vec_size, n_heads, block_size)
-        self.ln2 = nn.LayerNorm(vec_size)
-        self.mlp = MLPBlock(vec_size)
-        self.embed_dropout = nn.Dropout(p=0.1)
+        self.ln1 = nn.LayerNorm(cfg.vec_size)
+        self.mha = MultiHeadAttention(cfg)
+        self.ln2 = nn.LayerNorm(cfg.vec_size)
+        self.mlp = MLPBlock(cfg)
 
     def forward(self, x):  
         # this is not Pre-LN nor Post-LN (Pre-LN would be x + self.mha(self.ln1(x)))
@@ -77,19 +86,28 @@ class TransformerBlock():
         return x
 
 class Transformer(nn.Module):
-    def __init__(self, vocab_size, n_layer, vec_size, n_heads, block_size, save_name):
+    def __init__(self, name, model_cfg, dset_cfg):
         super().__init__()
 
-        self.embed = nn.Embedding(vocab_size, vec_size)
-        self.posn_embed = nn.Embedding(block_size, vec_size)  # learnable position embeddings rather than sin waves
-
-        self.blocks = nn.ModuleList([TransformerBlock(vec_size, n_heads, block_size) for _ in range(n_layer)])
-
-        self.unembed = nn.Linear(vec_size, vocab_size)
-
         # for saving stuff purposes
-        self.save_name = save_name
+        self.name = name
+        self.cfg = model_cfg
+        self.dset_cfg = dset_cfg
         self.best_loss = float('inf')
+        self.initialize_architecture()  # uses saved cfg to make the layers
+
+    
+    def initialize_architecture(self):
+        self.embed = nn.Embedding(self.dset_cfg.vocab_size, self.cfg.vec_size)
+        if self.cfg.posn_embed_type == "embeds":  # learnable position embeddings rather than sin waves
+            self.posn_embed = nn.Embedding(self.cfg.block_size, self.cfg.vec_size)
+        else:
+            raise NotImplementedError
+
+        self.blocks = nn.ModuleList([TransformerBlock(self.cfg)
+                                      for _ in range(self.cfg.n_layer)])
+
+        self.unembed = nn.Linear(self.cfg.vec_size, self.dset_cfg.vocab_size)
 
     def forward(self, x, logits=False):
         _, seq_len = x.shape
@@ -105,18 +123,17 @@ class Transformer(nn.Module):
     def save_model_state_dict(self, path=None, optim=None):
         if path is None:
             path = self.path
-        path = osp.join("models", path)
-        save_dict = {}
+        save_dict = {"model": self.state_dict(),
+                     "cfg": self.cfg,
+                     "dset_cfg": self.dset_cfg,
+                     "best_loss": self.best_loss}
         if optim is not None:
             save_dict["optim"] = optim.state_dict()
-        save_dict["model"] = self.state_dict()
-        save_dict["best_loss"] = self.best_loss
         torch.save(save_dict, path)
 
     def load_model_state_dict(self, path=None, optim=None):
         if path is None:
             path = self.path
-        path = osp.join("models", path)
         if not osp.exists(path):
             print("No existing model found", path)
             return
@@ -127,6 +144,12 @@ class Transformer(nn.Module):
                 optim.load_state_dict(load_dict["optim"])
             except KeyError:
                 print("Optimizer state not found!")
+
+        # make sure all layer sizes, blocks are correctly initialized before loading model state dict
+        self.cfg = load_dict["cfg"]
+        self.dset_cfg = load_dict["dset_cfg"]
+        self.initialize_architecture()
+        
         self.load_state_dict(load_dict["model"])
         self.best_loss = load_dict["best_loss"]
         

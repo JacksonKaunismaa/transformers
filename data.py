@@ -195,8 +195,6 @@ class TextDataset(Dataset):   # this gives batches with LOTS of padding
         self.vocab_size = len(self.encoder.idx_to_tok)
 
     def collate_fn(self, samples):
-        # 0 maps to ! for now 
-        # shouldnt really be a problem? our sequences end with \n so we can treat that as STOP
         padded = torch.nn.utils.rnn.pad_sequence(samples, 
                                                  padding_value=self.pad_token, 
                                                  batch_first=True)[:, :self.block_size] 
