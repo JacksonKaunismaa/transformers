@@ -1,13 +1,12 @@
-import torch
-from torch.utils.data import Dataset
 import requests
-from os import path as osp
-import json
+import os.path as osp
 import numpy as np
 import regex as re  # required since regular re does not support character classes \p
 import multiprocessing as mp
 import itertools
 from tqdm import tqdm
+import glob
+import json
 
 
 def create_byte_mapper():
@@ -126,33 +125,41 @@ class Encoder():  # or should it be called tokenizer
     def process_one(self, text):
         enc_tokens = self.encode(text)
         enc_tokens.append(self.eos_token)
-        return np.asarray(enc_tokens, dtype=np.uint16)
+        return np.asarray(enc_tokens, dtype=np.uint16), len(enc_tokens)
+    
+    def len_getter(self, tok_arr):
+        return tok_arr.shape[0]
 
-    def encode_file_list(self, out_fname, in_fnames):
+    def encode_file_list(self, data_dir, subdir, out_fname, nproc):
         all_lines = []
+        in_fnames = glob.glob(osp.join(data_dir, subdir, "*"))
+        np.random.shuffle(in_fnames)
+
         for fname in in_fnames:
             with open(fname, "r") as f_in:
                 all_lines.extend(f_in.readlines())
         print("Read all files in, beginning to encode...")
         # note that there is no benefit to doing this asynchronously since we need the full data size
         # to be able to start writing? (is this even true?)
-        with mp.Pool(7) as pool:  # use the heuristic/default chunksize used in Pool.map()
-            enc_lines = pool.map(self.process_one, all_lines, chunksize=len(all_lines)//(7*4))  # returns list of numpy arrays
+        with mp.Pool(nproc) as pool:  # use the heuristic/default chunksize used in Pool.map()
+            enc_lines = pool.map(self.process_one, all_lines, chunksize=len(all_lines)//(nproc*4))  # returns list of numpy arrays
+            print("Calculating size...")
+            total_size = sum(pool.map(self.len_getter, enc_lines))
         #enc_lines = [self.encode(line) for line in tqdm(all_lines)]
-        self.write_file(out_fname, enc_lines)
+        self.write_file(osp.join(data_dir,out_fname), enc_lines, total_size)
+        return total_size
 
 
-    def write_file(self, out_fname, enc_lines):
-        print("Calculating size...")
-        size = sum([e.shape[0] for e in tqdm(enc_lines)])
-        print("Preparing to write", size, "values to", out_fname)
-        out_f = np.memmap(out_fname, dtype=enc_lines[0].dtype, mode="w+", shape=(size,))
+    def write_file(self, out_fname, enc_lines, total_size):
+        print("Preparing to write", total_size, "values to", out_fname)
+        out_f = np.memmap(out_fname, dtype=enc_lines[0].dtype, mode="w+", shape=(total_size,))
         idx = 0
         for batch in tqdm(batch_data(enc_lines, 1024)): # write in groups of 1024
             linearized_data = np.concatenate(batch)
             out_f[idx: idx+len(linearized_data)] = linearized_data
             idx += len(linearized_data)
         out_f.flush()
+        #return size
 
     def decode(self, idx_list):
         # if tok is not in idx_to_tok its probably a control token like PAD or STOP or something else, so ignore it
@@ -165,65 +172,18 @@ class Encoder():  # or should it be called tokenizer
         return "".join(text)
     
 
-class IdxDataset(Dataset):  # this feels like it shouldn't work... (has to learn to ignore all context before EOS)
-    def __init__(self, fname, block_size, data_size, chunk_size):
-        self.data = np.memmap(fname, dtype=np.uint16, mode="r", shape=(data_size,))
-        self.encoder = get_encoder()
-        self.vocab_size = len(self.encoder.idx_to_tok)
-        self.block_size = block_size
-        # how finegrained to split the dataset. sequences are sampled from the beginning of chunks,
-        # each of which are chunksize in size. Also defines the len of the Dataset
-        self.chunk_size = chunk_size
 
-    def __len__(self):
-        return (self.data.shape[0] - self.block_size - 1) // self.chunk_size
-
-    def __getitem__(self, idx):
-        data_idx = idx*self.chunk_size
-        # due to the way len is defined, this shouldnt hit any IndexErrors
-        x = torch.tensor(self.data[data_idx : data_idx+self.block_size], dtype=torch.uint16)
-        y = torch.tensor(self.data[data_idx+1 : data_idx+self.block_size+1], dtype=torch.uint16)
-        # position indices, assuming that x[0] is position 0, resetting any time we hit an EOS
-        # seems like you could also store the actual positions in the dataset, and have it not start x[0] being at posn 0
-        #posn = 
-        return x, y
-
-
-class TextDataset(Dataset):   # this gives batches with LOTS of padding
-    def __init__(self, fname):
-        self.encoder = get_encoder()
-        self.vocab_size = len(self.encoder.idx_to_tok)
-
-    def collate_fn(self, samples):
-        padded = torch.nn.utils.rnn.pad_sequence(samples, 
-                                                 padding_value=self.pad_token, 
-                                                 batch_first=True)[:, :self.block_size] 
-        return padded[:, :-1], padded[:, 1:]
-
-
-    def __getitem__(self, idx):
-
-        text = self.strings[idx]
-        indices = self.encoder.encode(text)
-        indices = torch.tensor(indices, dtype=torch.uint16)
-
-        # inputs = indices[:-1]
-        # targets = indices[1:]
-
-        return indices  # do that in collate_fn instead
-
-    def __len__(self):
-        return len(self.strings)
-
-
-def get_encoder():
+def get_encoder(write_dir):
     # use openai token_to_idx and bpe_merge
-    download_remote("https://openaipublic.blob.core.windows.net/gpt-2/models/124M/encoder.json", "encoder.json")
-    download_remote("https://openaipublic.blob.core.windows.net/gpt-2/models/124M/vocab.bpe", "vocab.bpe")
+    encoder_path = osp.join(write_dir, "encoder.json")
+    vocab_path = osp.join(write_dir, "vocab.bpe")
 
-    with open("encoder.json", "r") as f:
+    download_remote("https://openaipublic.blob.core.windows.net/gpt-2/models/124M/encoder.json", encoder_path)
+    download_remote("https://openaipublic.blob.core.windows.net/gpt-2/models/124M/vocab.bpe", vocab_path)
+
+    with open(encoder_path, "r") as f:
         token_to_idx = json.load(f)
-    with open("vocab.bpe", "r") as f:
+    with open(vocab_path, "r") as f:
         bpe_merge_list = [tuple(x.strip().split()) for x in f.readlines()]
 
     return Encoder(token_to_idx, bpe_merge_list[1:-1])

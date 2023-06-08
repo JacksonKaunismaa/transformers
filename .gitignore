@@ -1,3 +1,6 @@
 **/__pycache__
-encoder.json
-vocab.bpe
+.ipynb_checkpoints/
+.vscode/
+checkpoint
+wandb/
+old-logs/

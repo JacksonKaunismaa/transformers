@@ -1,0 +1,42 @@
+#!/bin/bash
+#SBATCH --job-name=transformers-1-billion-google
+#SBATCH --nodes=1
+#SBATCH --cpus-per-gpu=4
+#SBATCH --gpus-per-node=1
+#SBATCH --mem-per-cpu=4gb
+#SBATCH --output=transforming.%j.out
+#SBATCH --error=transforming.%j.err
+#SBATCH --wait-all-nodes=1
+
+# key note, must specify "override" parameters positionally before the name of this batch script 'launch_job.slrm'
+export NCCL_IB_DISABLE=1
+export NCCL_DEBUG=INFO
+
+export MASTER_PORT="$(python -c 'import socket; s=socket.socket(); s.bind(("", 0)); print(s.getsockname()[1])')"
+
+if [[ $SLURM_NNODES -eq 1 ]]; then
+    export MASTER_ADDR="127.0.0.1"
+    bash run_experiment.sh 0
+else                                           # multi-node, {multi,single}-gpu
+    echo "multi, multi"
+    export MASTER_ADDR="$(hostname --fqdn)"
+    for index in $(seq 0 $(($SLURM_NTASKS-1))); do 
+        $SRUN_PATH -lN$index --mem-per-cpu=$SLURM_MEM_PER_CPU --gres=gpu:$SLURM_GPUS_PER_TASK -c $SLURM_CPUS_ON_NODE \
+            -N 1 -n 1 -r $index \
+            bash run_experiment.sh $index &>> slurm.${SLURM_JOB_ID}-worker-$index.out &
+    done
+fi
+
+wait
+
+# if [[ $SLURM_NNODES -eq 1 ]]; then
+#     export MASTER_ADDR="127.0.0.1"
+# else                                           # multi-node, {multi,single}-gpu
+#     export MASTER_ADDR="$(hostname --fqdn)"
+# fi
+# bash run_experiment.sh
+
+# wait
+# export MASTER_ADDR
+# SRUN_PATH=/opt/slurm/bin/srun
+# echo $SLURM_NNODES $SLURM_GPUS_PER_TASK
