@@ -40,6 +40,7 @@ class IdxDataset(Dataset):  # this feels like it shouldn't work... (has to learn
         self.ddp = exp_cfg.ddp
 
     def __len__(self):
+        # return 5
         return (self.cfg.total_size - self.block_size - 1) // self.cfg.chunk_size
     
     def dataloader(self):
@@ -47,16 +48,16 @@ class IdxDataset(Dataset):  # this feels like it shouldn't work... (has to learn
             sampler = torch.utils.data.DistributedSampler(self, shuffle=True)
         else:
             sampler = torch.utils.data.RandomSampler(self, replacement=False)
-
+        print("created sampler", utils.get_rank())
         return torch.utils.data.DataLoader(self, batch_size=self.batch_size, 
                                            sampler=sampler, 
                                            pin_memory=True,
-                                           num_workers=self.cfg.num_workers)
+                                           num_workers=1)#self.cfg.num_workers//2)  #//3 since the cpus aren't enough???
 
     def __getitem__(self, idx):
         if torch.is_tensor(idx):
             idx = idx.tolist()
-        print(f"rank {utils.get_rank()} accessed idx {idx}")
+        #print(f"rank {utils.get_rank()} accessed idx {idx}")
         # print(idx, type(idx))
         data_idx = idx * self.cfg.chunk_size  
         # due to the way len is defined, this shouldnt hit any IndexErrors

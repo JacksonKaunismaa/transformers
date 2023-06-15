@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 set -e
 PROJECT_DIR=/h/jackk/transformers
 cd $PROJECT_DIR
@@ -51,6 +51,7 @@ python3 -m wandb login $(cat wandb_api_key)
 # 		 	--rdzv-backend=c10d --rdzv-endpoint=$MASTER_ADDR:$MASTER_PORT \
 # 			run_experiment.py --num_workers=$SLURM_CPUS_PER_GPU
 # fi
-
-python3 run_experiment.py --local-world-size=$SLURM_GPUS_PER_NODE --nnodes=$SLURM_NNODES --rank=$1 --num_workers=$SLURM_CPUS_PER_GPU
+# would have used torchrun for this, but it just didn't work for some reason (couldn't get NCCL to not complain about
+# duplicate GPU use)
+python3 run_experiment.py --local-world-size=$SLURM_GPUS_PER_NODE --nnodes=$1 --rank=$2 --num-workers=$SLURM_CPUS_PER_GPU
 

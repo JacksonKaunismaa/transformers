@@ -7,6 +7,7 @@ import itertools
 from tqdm import tqdm
 import glob
 import json
+from typing import List
 
 
 def create_byte_mapper():
@@ -104,7 +105,7 @@ class Encoder():  # or should it be called tokenizer
         self.cache[token] = curr_token
         return curr_token
 
-    def encode(self, text):
+    def encode(self, text: str):
         try:
             tokens = re.findall(self.pat, text)
         except TypeError:
@@ -122,7 +123,7 @@ class Encoder():  # or should it be called tokenizer
             idx_list += idx_tok
         return idx_list
 
-    def process_one(self, text):
+    def process_one(self, text: str):
         enc_tokens = self.encode(text)
         enc_tokens.append(self.eos_token)
         return np.asarray(enc_tokens, dtype=np.uint16), len(enc_tokens)
@@ -161,7 +162,7 @@ class Encoder():  # or should it be called tokenizer
         out_f.flush()
         #return size
 
-    def decode(self, idx_list):
+    def decode(self, idx_list: List[int]):
         # if tok is not in idx_to_tok its probably a control token like PAD or STOP or something else, so ignore it
         tokens = [self.idx_to_tok[idx] for idx in idx_list if idx in self.idx_to_tok]
         text = []

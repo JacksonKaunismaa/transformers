@@ -15,46 +15,75 @@ from . import config_objects
 from . import network
 from . import data
 from . import utils
+from . import metrics
+from .utils import rprint
 
-def run_experiment(dsets, proj_name, ckpt_path, exp_config: config_objects.ExperimentCfg, extend=False, log_wandb=False):
+def run_experiment(dsets, proj_name, ckpt_path, exp_config: config_objects.ExperimentCfg, 
+                   extend=0, log_wandb=False, resume_id=""):
     if log_wandb and utils.get_rank() == 0:
-        wandb.init(project=proj_name, config={**dataclasses.asdict(exp_config), 
-                                              **dataclasses.asdict(dsets["train"].cfg)})
-    
-    net = network.Transformer(ckpt_path, exp_config, dsets["train"].cfg).to(dsets["train"].cfg.device)
+        wandb.init(project=proj_name, id=resume_id if resume_id else None, resume="must" if resume_id else None,
+                   config={**dataclasses.asdict(exp_config),
+                           **dataclasses.asdict(dsets["train"].cfg)})
+
+    #if exp_config.ddp:
+        # [print(utils.get_local_rank(), torch.cuda.get_device_properties(n)) for n in range(torch.cuda.device_count())]
+    net = network.Transformer(ckpt_path, exp_config, dsets["train"].cfg)
+
+    assert (exp_config.grad_accum_steps % utils.get_world_size() == 0)
+    exp_config.grad_accum_steps //= utils.get_world_size() # can write to config since wandb config is already set?       
+    device_id = utils.get_local_rank() # % utils.get_world_size()  # modulus to ensure contiguous?
+    # sort of hacky, so we only set the train dset_cfg, so we just need to ensure that we only use "train's" dset_cfg
+    # from within the train function
+    #exp_config.device = f"{exp_config.device}:{device_id}"
+    rprint("running with accum_step", exp_config.grad_accum_steps)
+    device = f"{utils.get_device_type()}:{device_id}"
+    # #rprint("setting device to", exp_config.device, net.cfg.device)
+        # os.environ["CUDA_VISIBLE_DEVICES"] = str(device_id)
+        # torch.cuda.set_device(device_id)  # so that NCCL knows we are using different devices
+
+    rprint("worker", utils.get_rank(), "has", device_id, "World size is ", utils.get_world_size(), "dev_cnt",
+            torch.cuda.device_count(), "dev_id", device_id, device, "localr", utils.get_local_rank(),
+            os.environ["MASTER_ADDR"], os.environ["MASTER_PORT"], "bad")
+
+    net = net.to(device)
+    # #rprint("setting device to", exp_config.device, net.cfg.device)
 
     if exp_config.compile:
         print("Compiling model...")
         net = torch.compile(net)
 
     if exp_config.ddp:
-        # [print(utils.get_local_rank(), torch.cuda.get_device_properties(n)) for n in range(torch.cuda.device_count())]
-        assert (exp_config.grad_accum_steps % utils.get_world_size() == 0)
-        exp_config.grad_accum_steps //= utils.get_world_size() # can write to config since wandb config is already set?       
-        device_id = utils.get_local_rank() # % utils.get_world_size()  # modulus to ensure contiguous?
-        # sort of hacky, so we only set the train dset_cfg, so we just need to ensure that we only use "train's" dset_cfg
-        # from within the train function
-        dsets['train'].cfg.device = f"{dsets['train'].cfg.device}:{device_id}"
-        # os.environ["CUDA_VISIBLE_DEVICES"] = str(device_id)
-        # torch.cuda.set_device(device_id)  # so that NCCL knows we are using different devices
-
-        print("worker", utils.get_rank(), "has", device_id, "World size is ", utils.get_world_size(), "dev_cnt",
-              torch.cuda.device_count(), "dev_id", device_id, dsets['train'].cfg.device, "localr", utils.get_local_rank(),
-              os.environ["MASTER_ADDR"], os.environ["MASTER_PORT"], "bad")
         net = DDP(net, device_ids=[device_id], output_device=device_id)
-        [print(utils.get_local_rank(), torch.cuda.memory_allocated(n)) for n in range(torch.cuda.device_count())]
-    for sample in dsets["train"].dataloader():
-        print(utils.get_rank(), "has", sample[0][0])
-        x,y = [el.to(dsets["train"].cfg.device, non_blocking=True) for el in sample]
-        print(net(x, y).item())
-        return
+        # [print(utils.get_local_rank(), torch.cuda.memory_allocated(n)) for n in range(torch.cuda.device_count())]
+    # for sample in dsets["train"].dataloader():
+    #     print(utils.get_rank(), "has", sample[0][0])
+    #     x,y = [el.to(dsets["train"].cfg.device, non_blocking=True) for el in sample]
+    #     print(net(x, y).item())
+    #     return
 
+    # #rprint("setting device to", exp_config.device, net.cfg.device)
 
     scaler, sched, optim = utils.get_raw(net).get_optim()
+    # #rprint("setting device to", exp_config.device, net.cfg.device)
 
-    if extend:
-        map_location = dsets['train'].cfg.device  # make sure we load to the right device
-        utils.get_raw(net).load_model_state_dict(map_location, scaler=scaler, sched=sched, optim=optim)
+    if extend:  # set extend to the slurm job id of the run that generated it so we can acces the checkpoint
+        map_location = device  # make sure we load to the right device
+        actual_ckpt_dir = osp.dirname(osp.realpath(ckpt_path))
+        old_ckpt_dir = osp.join(osp.dirname(actual_ckpt_dir), str(extend))  # go into the different job id's checkpoint dir
+        old_ckpt_path = osp.join(old_ckpt_dir, osp.basename(ckpt_path))
+        load_success = utils.get_raw(net).load_model_state_dict(map_location, path=old_ckpt_path, 
+                                                                scaler=scaler, sched=sched, optim=optim)
+        if not load_success:
+            print("Attempted to load from checkpoint, but failed, aborting")
+            return
+
+    # loss_res = {"eval":[]}
+    # utils.barrier()
+    # start_time = utils.get_time()
+    # evaluate(net, dsets, exp_config, loss_res)
+    # print(loss_res, utils.get_time() - start_time, utils.get_rank())
+    # dist.destroy_process_group()
+    # return
 
     train_result = train(net, scaler, sched, optim, exp_config, dsets, log_wandb)
     
@@ -130,66 +159,76 @@ def run_experiment(dsets, proj_name, ckpt_path, exp_config: config_objects.Exper
 #             pickle.dump(log_dict, p)
 
 
-@torch.no_grad()  # won't each rank get a slightly different number here?
-def evaluate(net, dsets, exp_config, all_losses):
-    net.eval()
-    losses = {split:[] for split in dsets}
-    for split, dset in dsets.items():
-        for i, sample in tqdm(enumerate(dset.dataloader())):
-                x,y = [el.to(dsets["train"].cfg.device, non_blocking=True) for el in sample]
-                losses[split].append(net(x, y).item())
-                if i > exp_config.num_eval:  # so that we don't iterate over the entire training set while estimating tr_loss
-                    break
-        all_losses[split].append(sum(losses[split])/len(losses[split]))
-    net.train()
-
 
 def train(net, scaler, scheduler, optimizer, exp_config: config_objects.ExperimentCfg, dsets, log_wandb):
-    losses = dict(train=[], eval=[])
+    # TODO: consider changing this weird iterated dictionary thing into something clearer
+    # maybe another class or only track the current epoch and do it with a {"loss", "perp", "accu"}
+    # then you don't have to compute "shortened" names, the code is simpler. Another option is to 
+    # put the "list" on the outside so that each entry in the list is a dict of {metric_name: value} mappings.
+    # the advantage is you don't have to any extra work for extracting the most recent epoch's results.
+    all_metrics = {k: dict(train=[], eval=[]) for k in ["loss", "perplexity", "accuracy"]}
+
     tr_loader = data.make_infinite(dsets["train"].dataloader())
     non_ddp_net = utils.get_raw(net)  # slight hack to get at the underlying Transformer object consistently
 
-    epoch_tokens = exp_config.grad_accum_steps * dist.get_world_size() * \
+    epoch_tokens = exp_config.grad_accum_steps * utils.get_world_size() * \
                    exp_config.batch_size * exp_config.block_size * exp_config.num_train  # num tokens in an "epoch"
 
+    # all_sentences = []  # do this entirely in python since wandb really hates being able to update artifacts
+    # sentence_artifact_name = "rand_sentences{}"  # do this since it would probably be too much io sadly
+    # sentence_batch = 
+    # #rprint("exp_cfg device", exp_config.device, "net device", non_ddp_net.cfg.device)
     while (curr_iter := scheduler.state_dict()["last_epoch"]) < exp_config.total_iters:
         start = utils.get_time()
+        #rprint("starting time", start)
         for i in tqdm(range(exp_config.num_train)):
+            #print("sampl", utils.get_rank())
             sample = next(tr_loader)  # TODO: maybe move getting the next sample to after the forward pass, to overlap better
-            x,y = [el.to(dsets["train"].cfg.device, non_blocking=True) for el in sample]
+            #print("sampled", utils.get_rank())
+            x,y = [el.to(net.device, non_blocking=True) for el in sample]
             if exp_config.ddp:
                 net.require_backward_grad_sync = ((i+1) % exp_config.grad_accum_steps == 0)
-            batch_loss = net(x, y) / exp_config.grad_accum_steps
+            batch_loss = net(x, y)[0] / exp_config.grad_accum_steps  # net returns (loss_value, logits) tuple
             scaler.scale(batch_loss).backward()  # accumulate scaled gradients
             if (i+1) % exp_config.grad_accum_steps == 0:  # only actually set gradients after grad_accum steps
                 scaler.unscale_(optimizer)  # unscale so that we can clip propely
                 torch.nn.utils.clip_grad_norm_(net.parameters(), exp_config.grad_clip)
                 scaler.step(optimizer)  # already gradients are unscaled (as they should be), this won't double unscale them
                 scaler.update()  # update scale parameter
+                # print("stepping")
                 optimizer.zero_grad(set_to_none=True)  # supposedly better on memory
                 scheduler.step()  # update LR
-
+        #rprint("done epoch")
         epoch_time = utils.get_time() - start
-
-        evaluate(net, dsets, exp_config, losses)
-        curr_iter = scheduler.state_dict()["last_epoch"]
-        epoch_summary = f'Iter {curr_iter}: ' + " ".join(f"{split[:2]}_loss: {loss[-1]:.4f}" for split,loss in losses.items())
+        #rprint("begin eval")
+        #rprint("otpmi has numparams", len(optimizer.param_groups[0]["params"]))
+        metrics.evaluate(net, dsets, exp_config, all_metrics)
+        curr_iter = scheduler.last_epoch
+        short_name_metrics = {f"{split[:2]}_{metric_name[:4]}": result[-1]  # shorten names of metrics for pretty printing
+                              for metric_name,results in all_metrics.items()  # read as an nested for-loop with the
+                                for split,result in results.items()}              # shown indentation
+        epoch_summary = f'Iter {curr_iter}: ' + " ".join(f"{name}: {val:.4f}" for name,val in short_name_metrics.items())
         if utils.get_rank() == 0:  # only 1 process needs to do this
             if log_wandb:
-                wandb.log({"tr_loss": losses["train"][-1], 
-                        "va_loss": losses["eval"][-1],
+                # all_sentences.extend([[curr_iter, sent] for sent in utils.sample_random_sentences(net, dsets, exp_config)])
+                # print(wandb.run.logged_artifacts())
+                rand_sentences = [[curr_iter, sent] for sent in utils.sample_random_sentences(non_ddp_net, dsets, exp_config)]
+                wandb.log({**short_name_metrics,
                         "lr": optimizer.param_groups[0]["lr"],
-                        "step": curr_iter,
-                        "tok_time": epoch_time/epoch_tokens})
+                        "tok_time": epoch_time/epoch_tokens,
+                        "rand_sentences": wandb.Table(columns=["step", "sentence"], data=rand_sentences),
+                        "step": curr_iter
+                        })#, step=curr_iter)  # TODO: fix this for later experiments
             print(epoch_summary)
-
-        if losses["eval"][-1] < non_ddp_net.best_loss:  # maybe dont save every epoch if loss improves?
-            non_ddp_net.best_loss = losses["eval"][-1]
-            if utils.get_rank() == 0:  # put rank check here so that all ranks have consistent .best_loss
-                non_ddp_net.save_model_state_dict(scaler=scaler, optim=optimizer, sched=scheduler)
+        #rprint("checking whether to save, best was", non_ddp_net.best_loss, "last loss was", all_metrics["loss"]["eval"][-1])
+        if all_metrics["loss"]["eval"][-1] < non_ddp_net.best_loss:  # maybe dont save every epoch if loss improves?
+            non_ddp_net.best_loss = all_metrics["loss"]["eval"][-1]
+            # if utils.get_rank() == 0:  # put rank check here so that all ranks have consistent .best_loss
+            # need to disable the rank check here since sharded optimizer requires all ranks to consolidate
+            non_ddp_net.save_model_state_dict(scaler=scaler, optim=optimizer, sched=scheduler)
                 # utils.barrier()  # wrapper around dist.barrier() that is a no-op if no ddp
                 
             
-    return losses
+    return all_metrics
 
 

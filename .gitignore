@@ -4,3 +4,4 @@
 checkpoint
 wandb/
 old-logs/
+scripts/logs

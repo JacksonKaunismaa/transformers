@@ -2,24 +2,56 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, MultiplicativeLR, SequentialLR
+from torch.distributed.optim import ZeroRedundancyOptimizer
 import numpy as np
 from os import path as osp
-from contextlib import nullcontext
+from typing import List, Union
 
 from . import config_objects
+from . import utils
+from .utils import rprint
 
 
 class MLPBlock(nn.Module):
     def __init__(self, cfg):
         super().__init__()
-        self.w_1 = nn.Linear(cfg.vec_size, cfg.vec_size*4)
+        self.w_1 = nn.Linear(cfg.vec_size, cfg.vec_size*4, bias=cfg.linear_bias)
         self.act_func1 = nn.GELU()
-        self.w_2 = nn.Linear(cfg.vec_size*4, cfg.vec_size)
+        self.w_2 = nn.Linear(cfg.vec_size*4, cfg.vec_size, bias=cfg.linear_bias)
         self.dropout = nn.Dropout(p=cfg.dropout_mlp)
 
     def forward(self, x):
         # x -> (batch, seq_len, vec_size)
         return self.w_2(self.act_func1(self.w_1(x)))
+    
+
+class CustomNormalizer(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.width = cfg.vec_size
+
+        self.scale = nn.Parameter(torch.ones(self.width))
+        self.bias = nn.Parameter(torch.zeros(self.width)) if cfg.normalizer_bias else None
+        self.norm_type = cfg.normalizer_type
+        self.p = cfg.rmsnorm_p  # only has effect if norm_type == "RMSNorm", modifies norm calculation to be pRMSNorm instead
+        self.eps = cfg.normalizer_eps
+
+    def forward(self, x):
+        if self.norm_type == "LayerNorm":
+            return F.layer_norm(x, self.width, self.scale, self.bias, eps=self.eps)
+        elif self.norm_type == "RMSNorm":  # mostly from https://github.com/bzhangGo/rmsnorm/blob/master/rmsnorm_torch.py
+            frac_size = int(self.width * self.p)
+
+            norm_selection = x[..., :frac_size]  # they do a split, not sure if that's better or worse
+            rms_norm = norm_selection.norm(2, dim=-1, keepdim=True) / np.sqrt(frac_size)
+
+            x_normed = x / (rms_norm + self.eps)
+            if self.bias:
+                return x_normed * self.scale + self.bias
+            return x_normed * self.scale
+        else:
+            raise NotImplementedError("Unrecognized normalizer type", self.norm_type)
+    
 
 class MultiHeadAttention(nn.Module):
     def __init__(self, cfg):
@@ -44,7 +76,6 @@ class MultiHeadAttention(nn.Module):
                              torch.tril(~torch.ones(cfg.block_size, cfg.block_size, 
                                                    dtype=torch.bool)).reshape(1,1, cfg.block_size, cfg.block_size))
 
-
     def forward(self, x):
         # x -> (batch, seq_len, vec_size)
         batch, seq_len, _ = x.shape
@@ -53,16 +84,17 @@ class MultiHeadAttention(nn.Module):
         q, k, v = torch.split(self.qkv(x_head), self.head_size, dim=-1)  # heads are (batch, seq_len, n_heads, head_size)
 
         if self.flash:  # scaled dot product attention
-            attn = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True,
+            attn = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=self.training,
                                                   dropout_p=self.attn_dropout_p if self.training else 0)
         else:
             # q is (batch, n_heads, seq_len, head_size) and k is (batch, n_heads, head_size, seq_len)
             attn_dots = q.transpose(1,2) @ k.transpose(1,2).transpose(2,3)  # attn_dots is (batch, n_heads, seq_len, seq_len)
 
             # mask out the future
-            causal_attn = attn_dots.masked_fill(self.causal_mask[..., :seq_len, :seq_len], -float("inf"))
+            if self.training:
+                attn_dots = attn_dots.masked_fill(self.causal_mask[..., :seq_len, :seq_len], -float("inf"))
 
-            attn_scores = F.softmax(causal_attn / np.sqrt(self.head_size), dim=-1) # softmax is (batch, n_heads, seq_len, seq_len)
+            attn_scores = F.softmax(attn_dots / np.sqrt(self.head_size), dim=-1) # softmax is (batch, n_heads, seq_len, seq_len)
             attn_scores = self.attn_dropout(attn_scores)
 
             attn = attn_scores @ v.transpose(1,2)  # v is (batch, n_heads, seq_len, head_size), attn is (batch, n_heads, seq_len, head_size)
@@ -74,9 +106,9 @@ class TransformerBlock(nn.Module):
     def __init__(self, cfg):
         # design pattern: never pass in parameters directly into initializing a nn.Module, always use the cfg object
         super().__init__()
-        self.ln1 = nn.LayerNorm(cfg.vec_size)
+        self.ln1 = CustomNormalizer(cfg)
         self.mha = MultiHeadAttention(cfg)
-        self.ln2 = nn.LayerNorm(cfg.vec_size)
+        self.ln2 = CustomNormalizer(cfg)
         self.mlp = MLPBlock(cfg)
         self.layer_norm_type = cfg.layer_norm_type
 
@@ -120,7 +152,8 @@ class Transformer(nn.Module):
         self.unembed = nn.Linear(self.cfg.vec_size, self.dset_cfg.vocab_size)
         
         # set up autocasting
-        self.fwd_ctx = torch.autocast(device_type=self.dset_cfg.device, dtype=getattr(torch, self.cfg.dtype))
+        rprint(self.device, "deiece")
+        self.fwd_ctx = torch.autocast(device_type=utils.get_device_type(), dtype=getattr(torch, self.cfg.dtype))
 
         print(f"Num parameters: {self.num_params()} M")
         print(f"Approximate expected train vram usage: {self.expected_vram_size():.2f} GB")
@@ -139,39 +172,99 @@ class Transformer(nn.Module):
     def forward(self, x, targets=None):
         with self.fwd_ctx:  # autocast, technically this is slightly different than doing `with fwd_ctx: model(x);`
             _, seq_len = x.shape  # not strictly "correct" since we sort of cut sequences up so position embeddings are wrong here
-            posn_embeds = self.posn_embed(torch.arange(seq_len, device=self.dset_cfg.device)).unsqueeze(0)
+            # rprint("xdev", x.device, "proper_dev", self.device, "posn_embed", self.posn_embed.weight.device)
+            posn_embeds = self.posn_embed(torch.arange(seq_len, device=self.device)).unsqueeze(0)
             x = self.embed(x) + posn_embeds
             for block in self.blocks:
                 x = block(x)
 
             out = self.unembed(x)
-            if targets is None:  # ie. inference mode
+            if targets is None:  # ie. inference mode, return logits so we can do temperature stuff
                 return out   # F.softmax(out, dim=-1)
             else:  # flatten across batches and positions so that we can compare indices (in `targets`) to distributions (in `out`)
                 #print(out, targets)
                 #print(F.cross_entropy(out.view(-1, self.dset_cfg.vocab_size), targets.view(-1)))
-                return F.cross_entropy(out.view(-1, self.dset_cfg.vocab_size), targets.view(-1))
+                return F.cross_entropy(out.view(-1, self.dset_cfg.vocab_size), targets.view(-1)), out
 
+    @torch.no_grad()    # probably should make a batched version of this ?
+    def generate(self, encoder, prompt: Union[str, List[int]], temperature=0.2) -> str:  
+        self.eval()
+        if isinstance(prompt, str):
+            prompt = encoder.encode(prompt)
+
+        tokens = torch.tensor(prompt).unsqueeze(0).to(self.device)
+        if tokens.dim() == 1:  # account for prompt size 1
+            tokens = tokens.unsqueeze(0)
+        
+        # => 2*block_size is max generated size
+        while tokens[0, -1] != encoder.eos_token and tokens.shape[1] < 2*self.cfg.block_size:
+            # unsqueeze to add batch dim, 0 to rm it, -1 to see last posn in sequence
+            # print("token shape", tokens.shape)
+            logits = self(tokens[:, -self.cfg.block_size:])
+            #print("logit shape", logits.shape)
+            if temperature > 0:
+                #print(logits[:, -1, :].shape)
+                # input("about to div temp")
+                logits[:, -1, :] /= temperature
+                # input("about to softm")
+                probs = F.softmax(logits, dim=-1)  # 0 to select batch, -1 to select last position in sequence
+                # input("about to multinomail")
+                #print("probs shape", probs.shape, probs[:, -1, :].shape)
+                next_token = torch.multinomial(probs[:, -1, :], 1)
+            else:  # argmax, temp 0
+                next_token = logits[:, -1, :].argmax()
+            tokens = torch.cat((tokens, next_token), dim=1)  # concat onto seq_len dimension
+            #print("new shape", tokens.shape, tokens[0, -1], next_token, self.embed.weight.shape)
+        return encoder.decode(tokens.squeeze().detach().cpu().numpy())
     
-    def save_model_state_dict(self, **kwargs):  # kwargs should contain optimizer,scheduler, and scaler
+    def save_model_state_dict(self, optim=None, path=None, **kwargs):  # kwargs should contain optimizer,scheduler, and scaler
+        if path is None:
+            path = self.path
+
         save_dict = {"model": self.state_dict(),
                      "cfg": self.cfg,
                      "dset_cfg": self.dset_cfg,
                      "best_loss": self.best_loss}
-        
-        for k,obj in kwargs.items():  # add optimizer, scheduler, scaler state dicts
+
+        if self.cfg.ddp and self.cfg.zero and optim is not None:  # sharded optimizer => need to collate before saving
+            rprint("is consolidating")
+            rprint("Has state", optim.state.keys())
+            rprint("pre consolidate, has num_params", len(optim.param_groups[0]["params"]))
+            optim.consolidate_state_dict()
+            rprint("post consolidate, rank, has num_params", len(optim.param_groups[0]["params"]))
+
+            if utils.get_rank() == 0:
+                rprint("is saving", optim.state_dict().keys())
+                rprint("saving num_params", len(optim.state_dict()["param_groups"][0]["params"]))
+                save_dict["optim"] = optim.state_dict()  # it transfers shards to CPU first, so GPU mem is fine
+            rprint("done consolidating")
+        elif optim is not None:
+            save_dict["optim"] = optim.state_dict()
+
+        for k,obj in kwargs.items():  # add scheduler, scaler state dicts
             save_dict[k] = obj.state_dict()
+        
+        if utils.get_rank() == 0:
+            rprint("saving being done")
+            torch.save(save_dict, path)  # only do teh actual io if rank 0
 
-        torch.save(save_dict, self.path)
+    def load_model_state_dict(self, map_location, path=None, **kwargs) -> bool:
+        # kwargs should contain optimizer,scheduler, and scaler
+        if path is None:
+            path = self.path
 
-    def load_model_state_dict(self, map_location, **kwargs):  # kwargs should contain optimizer,scheduler, and scaler
-        if not osp.exists(self.path):
-            print("No existing model found", self.path)
-            return
-        print("Found path of", self.path)
-        load_dict = torch.load(self.path, map_location=map_location)
-
+        if not osp.exists(path):
+            print("No existing model found", path)
+            return False
+        print("Found path of", path)
+        load_dict = torch.load(path, map_location=map_location)  # load everything onto cpu so that for sharded models, it doesn't fail
+        rprint(load_dict["model"].keys())
+        rprint("keys", load_dict.keys())
+        rprint("is loading to", map_location)
+        rprint("has num_params", len(kwargs["optim"].param_groups[0]["params"]))
         for k,obj in kwargs.items():  # load optimizer, scheduler, scaler state dicts
+            if k == "optim":
+                rprint(len(obj.param_groups[0]["params"]), type(obj.param_groups[0]["params"][0]), len(load_dict[k]["param_groups"][0]["params"]))
             obj.load_state_dict(load_dict[k])
 
         # make sure all layer sizes, blocks are correctly initialized before loading model state dict
@@ -181,12 +274,17 @@ class Transformer(nn.Module):
         
         self.load_state_dict(load_dict["model"])
         self.best_loss = load_dict["best_loss"]
+        return True
         
 
     def get_optim(self): # optim, sched, scaler, autocast context
         # set initial LR to 1 so that the LinearLR/warmup stage works better
-        # ZeroRedundancyOptimizer
-        optim = torch.optim.Adam(self.parameters(), weight_decay=self.cfg.weight_decay, lr=self.cfg.lr_max)
+        if self.cfg.zero and self.cfg.ddp:
+            optim = ZeroRedundancyOptimizer(self.parameters(),
+                                            optimizer_class=torch.optim.Adam,
+                                            lr=self.cfg.lr_max, weight_decay=self.cfg.weight_decay)
+        else:
+            optim = torch.optim.Adam(self.parameters(), weight_decay=self.cfg.weight_decay, lr=self.cfg.lr_max)
         warmup_sched = LinearLR(optim, start_factor=self.cfg.lr_min/self.cfg.lr_max, 
                                 end_factor=1., total_iters=self.cfg.t_warmup)
         # t_decay - t_warmup since we include the first t_warmup iters in the "decay" period
@@ -198,6 +296,10 @@ class Transformer(nn.Module):
         
         scaler = torch.cuda.amp.GradScaler(enabled=(self.cfg.dtype == "float16"))  # only need scaling on float16
         return scaler, combined_sched, optim
+    
+    @property  # so that it works through a .to
+    def device(self):
+        return self.embed.weight.device
 
 
 # class OptimizerState():  # if there is one more thing, ill consider actually implementing something like this
