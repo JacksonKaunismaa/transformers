@@ -10,7 +10,7 @@ class ExperimentCfg:
     n_heads: int = 12
     n_layer: int = 12
     posn_embed_type: str = "embeds"
-    layer_norm_type: str = "weird"
+    layer_norm_posn: str = "weird"
     block_size: int = 2048
     flash: bool = True  # whether to use Flash attention or not
     dtype: str = "bfloat16"  # float32, float16, and bfloat16 are supported (for mixed precision)
@@ -31,29 +31,32 @@ class ExperimentCfg:
     lr_min: float = 1e-7 # warmup stage
     lr_max: float = 1e-3  # warmup stage
     t_warmup: int = 1500
-    t_decay: int = 600_000  # should match target number of training steps
+    t_decay: int = 40_000  # should match target number of training steps (total_steps)
 
     # Training params
-    total_iters: int = 600_000
-    num_train: int = 6_000  # every num_train macro-batches, do an eval
-    num_eval: int = 500  # do at most this many macro batches to estimate losses (train and eval) at the end of an epoch
+    total_steps: int = 40_000  # set so that we see each token in the dataset 10x?
+    train_steps: int = 500  # every num_train macro-batches, do an eval (yes, i realize this definition conflicts with num_eval and is confusing)
+    num_eval: int = 500  # do at most this many micro batches to estimate losses (train and eval) at the end of an epoch
     # epochs: int = 50
     grad_clip: float = 1.0
     weight_decay: float = 0
     batch_size: int = 32
-    grad_accum_steps: int = 4  # batch_size * grad_accum_steps * block_size = num tokens per batch (262,144)
+    grad_accum_steps: int = 4  # batch_size * num_grad_accum * block_size = num tokens per macro-batch (should be ~250_000)
     compile: bool = False # whether or not to compile the model
     ddp: bool = False   # whether or not to use DistributedDataParallel
     zero: bool = False  # whether or not to use ZeroRedundancyOptimizer (only if ddp set)
-    # checkpointing: bool = False  # whether or not to use activation checkpointing
+    checkpointing: bool = False  # whether or not to use activation checkpointing
 
     def __hash__(self):
         return hash(str(self))
     
     def get_dry(self):
         # some defaults that are meant for running a very small network while debugging
-        return dataclasses.replace(self, vec_size=128, n_layer=1, n_heads=1, lr_max=2e-4, lr_min=1e-7, block_size=10, batch_size=1,
-                grad_accum_steps=8, num_train=16, num_eval=3, dtype="float16", compile=False, zero=False, 
+        # return dataclasses.replace(self, vec_size=1280, n_layer=10, n_heads=1, lr_max=2e-4, lr_min=1e-7, block_size=10, batch_size=1,
+        #         grad_accum_steps=8, train_steps=2, num_eval=3, dtype="float16", compile=False, zero=False, checkpointing=False,
+        #         normalizer_type="RMSNorm", rmsnorm_p=0.2)
+        return dataclasses.replace(self, 
+                grad_accum_steps=8, train_steps=2, num_eval=3, dtype="float16", compile=False, zero=False, checkpointing=True,
                 normalizer_type="RMSNorm", rmsnorm_p=0.2)
     
 

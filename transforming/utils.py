@@ -72,11 +72,10 @@ def sample_random_sentences(net, dsets, exp_config, num_sample=5, temperature=0.
     return [net.generate(dsets["eval"].encoder, tok, temperature=temperature) for tok in start_tokens]
 
 
-# TODO: use this for activation checkpointing
-def traverse_modules(func, mod, curr_name="", **kwargs):  # good for setting up hooks
+def traverse_modules(func, mod):
     has_sub_mods = False
-    for name, sub_mod in mod.named_children():
-        traverse_modules(func, sub_mod, curr_name=f"{curr_name}{name}.", **kwargs)
+    for sub_mod in mod.children():
+        traverse_modules(func, sub_mod)
         has_sub_mods = True
     if not has_sub_mods: # if no submodules, it is an actual operation
-        func(mod, curr_name, **kwargs)
+        func(mod)

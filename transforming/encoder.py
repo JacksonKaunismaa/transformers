@@ -162,14 +162,16 @@ class Encoder():  # or should it be called tokenizer
         out_f.flush()
         #return size
 
-    def decode(self, idx_list: List[int]):
+    def decode(self, idx_list: List[int], split=False):
         # if tok is not in idx_to_tok its probably a control token like PAD or STOP or something else, so ignore it
         tokens = [self.idx_to_tok[idx] for idx in idx_list if idx in self.idx_to_tok]
         text = []
         for tok in tokens:
             text_tok = [chr(self.byte_decoder[c]) for c in tok]
-            text += text_tok
+            text.append("".join(text_tok))
         # print(text)
+        if split:
+            return text
         return "".join(text)
     
 

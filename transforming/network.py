@@ -2,10 +2,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, MultiplicativeLR, SequentialLR
-from torch.distributed.optim import ZeroRedundancyOptimizer
+from torch.distributed.optim import ZeroRedundancyOptimizer # type: ignore
 import numpy as np
 from os import path as osp
 from typing import List, Union
+import torch.utils.checkpoint as ckpt
+
 
 from . import config_objects
 from . import utils
@@ -16,13 +18,13 @@ class MLPBlock(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.w_1 = nn.Linear(cfg.vec_size, cfg.vec_size*4, bias=cfg.linear_bias)
-        self.act_func1 = nn.GELU()
+        self.act_func = nn.GELU()
         self.w_2 = nn.Linear(cfg.vec_size*4, cfg.vec_size, bias=cfg.linear_bias)
         self.dropout = nn.Dropout(p=cfg.dropout_mlp)
 
     def forward(self, x):
         # x -> (batch, seq_len, vec_size)
-        return self.w_2(self.act_func1(self.w_1(x)))
+        return self.dropout(self.w_2(self.act_func(self.w_1(x))))
     
 
 class CustomNormalizer(nn.Module):
@@ -64,7 +66,7 @@ class MultiHeadAttention(nn.Module):
         self.flash = cfg.flash
         self.attn_dropout_p = cfg.dropout_attn
 
-        self.qkv = nn.Linear(self.head_size, 3*self.head_size, bias=False)
+        self.qkv = nn.Linear(self.vec_size, 3*self.vec_size, bias=False)
         self.out = nn.Linear(self.vec_size, self.vec_size, bias=False)
 
         self.attn_dropout = nn.Dropout(p=self.attn_dropout_p)
@@ -79,26 +81,29 @@ class MultiHeadAttention(nn.Module):
     def forward(self, x):
         # x -> (batch, seq_len, vec_size)
         batch, seq_len, _ = x.shape
-        x_head = x.view(batch, seq_len, self.n_heads, self.head_size)
+        # x_head = x.view(batch, seq_len, self.n_heads, self.head_size)
 
-        q, k, v = torch.split(self.qkv(x_head), self.head_size, dim=-1)  # heads are (batch, seq_len, n_heads, head_size)
+        qkv = torch.split(self.qkv(x), self.vec_size, dim=-1)  # q,k,v are (batch, seq_len, n_heads, head_size)
+        # transpose so that multiplications are done to each position, not each head
+        q,k,v = [mat.view(batch, seq_len, self.n_heads, self.head_size).transpose(1,2) for mat in qkv]
 
         if self.flash:  # scaled dot product attention
-            attn = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=self.training,
+            attn = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True,
                                                   dropout_p=self.attn_dropout_p if self.training else 0)
         else:
             # q is (batch, n_heads, seq_len, head_size) and k is (batch, n_heads, head_size, seq_len)
-            attn_dots = q.transpose(1,2) @ k.transpose(1,2).transpose(2,3)  # attn_dots is (batch, n_heads, seq_len, seq_len)
+            attn_dots = q @ k.transpose(2,3)  # attn_dots is (batch, n_heads, seq_len, seq_len)
 
             # mask out the future
             if self.training:
-                attn_dots = attn_dots.masked_fill(self.causal_mask[..., :seq_len, :seq_len], -float("inf"))
+                attn_dots = attn_dots.masked_fill(self.causal_mask[..., :seq_len, :seq_len], -float("inf")) # type: ignore
 
-            attn_scores = F.softmax(attn_dots / np.sqrt(self.head_size), dim=-1) # softmax is (batch, n_heads, seq_len, seq_len)
-            attn_scores = self.attn_dropout(attn_scores)
+            attn_scores = F.softmax(attn_dots / np.sqrt(self.head_size), dim=-1)
+            attn_scores = self.attn_dropout(attn_scores)  # attn_scores is (batch, n_heads, seq_len, seq_len)
 
-            attn = attn_scores @ v.transpose(1,2)  # v is (batch, n_heads, seq_len, head_size), attn is (batch, n_heads, seq_len, head_size)
+            attn = attn_scores @ v  # v is (batch, n_heads, seq_len, head_size), attn is (batch, n_heads, seq_len, head_size)
 
+        # transpose first so that the reshape operates on the last 2 dimensions only, stacking heads
         out = self.out(attn.transpose(1,2).reshape(batch, seq_len, self.vec_size))  # (batch, seq_len, vec_size)
         return self.out_dropout(out)
 
@@ -110,22 +115,24 @@ class TransformerBlock(nn.Module):
         self.mha = MultiHeadAttention(cfg)
         self.ln2 = CustomNormalizer(cfg)
         self.mlp = MLPBlock(cfg)
-        self.layer_norm_type = cfg.layer_norm_type
+        self.layer_norm_posn = cfg.layer_norm_posn
 
     def forward(self, x):  
         # however, it seems like "werid" might have the same properties as Pre-LN, since norms of the residual stream will 
         # be increasing with depth. The actual minGPT repo, upon which this is inspired, does mha(ln(x)), which is the actual 
         # Pre-LN, but I'm curious how this performs, so I'll leave it for now. It feels like it kinda defeats the point of LN,
         # which is supposed to keep the distributions input into a given layer typical, but who knows.
-        if self.layer_norm_type == "weird":
+        if self.layer_norm_posn == "weird":
             x = x + self.ln1(self.mha(x))
             x = x + self.ln2(self.mlp(x))
-        elif self.layer_norm_type == "post":
+        elif self.layer_norm_posn == "post":
             x = self.ln1(x + self.mha(x))
             x = self.ln2(x + self.mlp(x))
-        else: #  self.layer_norm_type == "pre":
+        elif self.layer_norm_posn == "pre":
             x = x + self.mha(self.ln1(x))
             x = x + self.mlp(self.ln2(x))
+        else:
+            raise NotImplementedError(f"Layer norm posn '{self.layer_norm_posn}' not supported.")
         return x
 
 class Transformer(nn.Module):
@@ -137,6 +144,7 @@ class Transformer(nn.Module):
         self.cfg = model_cfg
         self.dset_cfg = dset_cfg
         self.best_loss = float('inf')
+        self.checkpointing_setup = False  # flag to make sure we only ever set up checkpointing once
         self.initialize_architecture()  # uses saved cfg to make the layers
     
     def initialize_architecture(self):
@@ -152,8 +160,11 @@ class Transformer(nn.Module):
         self.unembed = nn.Linear(self.cfg.vec_size, self.dset_cfg.vocab_size)
         
         # set up autocasting
-        rprint(self.device, "deiece")
-        self.fwd_ctx = torch.autocast(device_type=utils.get_device_type(), dtype=getattr(torch, self.cfg.dtype))
+        rprint(utils.get_device_type(), "deiece")
+        self.fwd_ctx = torch.autocast(device_type=utils.get_device_type(), dtype=getattr(torch, self.cfg.dtype)) # type: ignore
+
+        if self.cfg.checkpointing:
+            self.add_activation_checkpointing()
 
         print(f"Num parameters: {self.num_params()} M")
         print(f"Approximate expected train vram usage: {self.expected_vram_size():.2f} GB")
@@ -195,7 +206,6 @@ class Transformer(nn.Module):
         tokens = torch.tensor(prompt).unsqueeze(0).to(self.device)
         if tokens.dim() == 1:  # account for prompt size 1
             tokens = tokens.unsqueeze(0)
-        
         # => 2*block_size is max generated size
         while tokens[0, -1] != encoder.eos_token and tokens.shape[1] < 2*self.cfg.block_size:
             # unsqueeze to add batch dim, 0 to rm it, -1 to see last posn in sequence
@@ -212,7 +222,7 @@ class Transformer(nn.Module):
                 #print("probs shape", probs.shape, probs[:, -1, :].shape)
                 next_token = torch.multinomial(probs[:, -1, :], 1)
             else:  # argmax, temp 0
-                next_token = logits[:, -1, :].argmax()
+                next_token = logits[:, -1, :].argmax(dim=-1).unsqueeze(0)
             tokens = torch.cat((tokens, next_token), dim=1)  # concat onto seq_len dimension
             #print("new shape", tokens.shape, tokens[0, -1], next_token, self.embed.weight.shape)
         return encoder.decode(tokens.squeeze().detach().cpu().numpy())
@@ -236,6 +246,7 @@ class Transformer(nn.Module):
             if utils.get_rank() == 0:
                 rprint("is saving", optim.state_dict().keys())
                 rprint("saving num_params", len(optim.state_dict()["param_groups"][0]["params"]))
+                rprint("state_dict device is", optim.state_dict()["state"][0]["exp_avg"].device)
                 save_dict["optim"] = optim.state_dict()  # it transfers shards to CPU first, so GPU mem is fine
             rprint("done consolidating")
         elif optim is not None:
@@ -261,7 +272,7 @@ class Transformer(nn.Module):
         rprint(load_dict["model"].keys())
         rprint("keys", load_dict.keys())
         rprint("is loading to", map_location)
-        rprint("has num_params", len(kwargs["optim"].param_groups[0]["params"]))
+        # rprint("has num_params", len(kwargs["optim"].param_groups[0]["params"]))
         for k,obj in kwargs.items():  # load optimizer, scheduler, scaler state dicts
             if k == "optim":
                 rprint(len(obj.param_groups[0]["params"]), type(obj.param_groups[0]["params"][0]), len(load_dict[k]["param_groups"][0]["params"]))
@@ -270,7 +281,7 @@ class Transformer(nn.Module):
         # make sure all layer sizes, blocks are correctly initialized before loading model state dict
         self.cfg = load_dict["cfg"]  # this shouldn't be necessary since loading optim beforehand requires that it be
         self.dset_cfg = load_dict["dset_cfg"]  # correctly initialized already
-        # self.initialize_architecture()
+        # self.initialize_architecture()   # bad for setting up checkpointing reasons
         
         self.load_state_dict(load_dict["model"])
         self.best_loss = load_dict["best_loss"]
@@ -294,8 +305,34 @@ class Transformer(nn.Module):
         combined_sched = SequentialLR(optim, [warmup_sched, decay_sched, const_sched], 
                                       milestones=[self.cfg.t_warmup, self.cfg.t_decay])
         
-        scaler = torch.cuda.amp.GradScaler(enabled=(self.cfg.dtype == "float16"))  # only need scaling on float16
+        # only need scaling on float16
+        scaler = torch.cuda.amp.GradScaler(enabled=(self.cfg.dtype == "float16"))  # type: ignore 
         return scaler, combined_sched, optim
+
+    def add_activation_checkpointing(self):
+        if self.checkpointing_setup:
+            return
+        self.checkpointing_setup = True
+
+        def add_checkpointing(module):
+            if isinstance(module, (nn.GELU, CustomNormalizer)):
+                orig_forward = module.forward
+                def checkpoint_fwd(*inputs):
+                    return ckpt.checkpoint(orig_forward, *inputs, preserve_rng_state=False)
+                module.forward = checkpoint_fwd  # type: ignore
+        
+        # def add_checkpointing(mod):
+            # def save_inpt_hook(layer, inpt):  # save the input so that the ckpt.checkpoint knows what inpt is
+            #     self._inputs[curr_name] = inpt
+            # def free_inpt_hook(layer, inpt, outpt):  # free the memory after so we don't waste space in the _inputs dict
+            #     self._inputs[curr_name] = None # mark memory as free
+                # mod.register_forward_pre_hook(save_inpt_hook)  # register hooks so input is available to the ckpt.checkpoint
+                # mod.register_forward_hook(free_inpt_hook)
+                # replace forward with checkpointed version
+                    
+                # mod.forward = checkpoint_fwd(mod)#ckpt.checkpoint(mod.forward, self._inputs[curr_name]) # type: ignore
+
+        utils.traverse_modules(add_checkpointing, self)
     
     @property  # so that it works through a .to
     def device(self):

@@ -32,7 +32,7 @@ class IdxDataset(Dataset):  # this feels like it shouldn't work... (has to learn
         self.encoder = encoder.get_encoder(dset_cfg.dataset_path)
         
         self.cfg = copy.copy(dset_cfg)
-        self.cfg.vocab_size = len(self.encoder.idx_to_tok)
+        self.cfg.vocab_size = int(np.ceil(len(self.encoder.idx_to_tok)/64)*64)  # pad by rounding up to nearest 64 for efficiency
         self.cfg.total_size = self.data.shape[0]
         
         self.block_size = exp_cfg.block_size  # don't put into the cfg object since we don't really want to store the same info 2x

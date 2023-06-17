@@ -1,4 +1,4 @@
-from tqdm import tqdm
+from tqdm import tqdm, trange
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -8,8 +8,8 @@ import itertools
 import wandb
 import numpy as np
 import dataclasses
-import time
 import os
+import time
 
 from . import config_objects
 from . import network
@@ -27,6 +27,7 @@ def run_experiment(dsets, proj_name, ckpt_path, exp_config: config_objects.Exper
 
     #if exp_config.ddp:
         # [print(utils.get_local_rank(), torch.cuda.get_device_properties(n)) for n in range(torch.cuda.device_count())]
+    print("model save path is ", ckpt_path)
     net = network.Transformer(ckpt_path, exp_config, dsets["train"].cfg)
 
     assert (exp_config.grad_accum_steps % utils.get_world_size() == 0)
@@ -41,10 +42,6 @@ def run_experiment(dsets, proj_name, ckpt_path, exp_config: config_objects.Exper
         # os.environ["CUDA_VISIBLE_DEVICES"] = str(device_id)
         # torch.cuda.set_device(device_id)  # so that NCCL knows we are using different devices
 
-    rprint("worker", utils.get_rank(), "has", device_id, "World size is ", utils.get_world_size(), "dev_cnt",
-            torch.cuda.device_count(), "dev_id", device_id, device, "localr", utils.get_local_rank(),
-            os.environ["MASTER_ADDR"], os.environ["MASTER_PORT"], "bad")
-
     net = net.to(device)
     # #rprint("setting device to", exp_config.device, net.cfg.device)
 
@@ -53,6 +50,9 @@ def run_experiment(dsets, proj_name, ckpt_path, exp_config: config_objects.Exper
         net = torch.compile(net)
 
     if exp_config.ddp:
+        rprint("worker", utils.get_rank(), "has", device_id, "World size is ", utils.get_world_size(), "dev_cnt",
+            torch.cuda.device_count(), "dev_id", device_id, device, "localr", utils.get_local_rank(),
+            os.environ["MASTER_ADDR"], os.environ["MASTER_PORT"], "bad")
         net = DDP(net, device_ids=[device_id], output_device=device_id)
         # [print(utils.get_local_rank(), torch.cuda.memory_allocated(n)) for n in range(torch.cuda.device_count())]
     # for sample in dsets["train"].dataloader():
@@ -84,7 +84,10 @@ def run_experiment(dsets, proj_name, ckpt_path, exp_config: config_objects.Exper
     # print(loss_res, utils.get_time() - start_time, utils.get_rank())
     # dist.destroy_process_group()
     # return
-
+    # print("waititng to log network params alone")
+    # for _ in range(180):
+    #     time.sleep(1)
+    # print("done logging network params usage alon")
     train_result = train(net, scaler, sched, optim, exp_config, dsets, log_wandb)
     
     if log_wandb and utils.get_rank() == 0:
@@ -172,36 +175,33 @@ def train(net, scaler, scheduler, optimizer, exp_config: config_objects.Experime
     non_ddp_net = utils.get_raw(net)  # slight hack to get at the underlying Transformer object consistently
 
     epoch_tokens = exp_config.grad_accum_steps * utils.get_world_size() * \
-                   exp_config.batch_size * exp_config.block_size * exp_config.num_train  # num tokens in an "epoch"
+                    exp_config.batch_size * exp_config.block_size * exp_config.train_steps  # num tokens in an "epoch"
 
     # all_sentences = []  # do this entirely in python since wandb really hates being able to update artifacts
     # sentence_artifact_name = "rand_sentences{}"  # do this since it would probably be too much io sadly
     # sentence_batch = 
     # #rprint("exp_cfg device", exp_config.device, "net device", non_ddp_net.cfg.device)
-    while (curr_iter := scheduler.state_dict()["last_epoch"]) < exp_config.total_iters:
+    while (curr_iter := scheduler.last_epoch) < exp_config.total_steps:
         start = utils.get_time()
         #rprint("starting time", start)
-        for i in tqdm(range(exp_config.num_train)):
-            #print("sampl", utils.get_rank())
-            sample = next(tr_loader)  # TODO: maybe move getting the next sample to after the forward pass, to overlap better
-            #print("sampled", utils.get_rank())
-            x,y = [el.to(net.device, non_blocking=True) for el in sample]
-            if exp_config.ddp:
-                net.require_backward_grad_sync = ((i+1) % exp_config.grad_accum_steps == 0)
-            batch_loss = net(x, y)[0] / exp_config.grad_accum_steps  # net returns (loss_value, logits) tuple
-            scaler.scale(batch_loss).backward()  # accumulate scaled gradients
-            if (i+1) % exp_config.grad_accum_steps == 0:  # only actually set gradients after grad_accum steps
-                scaler.unscale_(optimizer)  # unscale so that we can clip propely
-                torch.nn.utils.clip_grad_norm_(net.parameters(), exp_config.grad_clip)
-                scaler.step(optimizer)  # already gradients are unscaled (as they should be), this won't double unscale them
-                scaler.update()  # update scale parameter
-                # print("stepping")
-                optimizer.zero_grad(set_to_none=True)  # supposedly better on memory
-                scheduler.step()  # update LR
-        #rprint("done epoch")
+        for _ in trange(exp_config.train_steps):
+
+            for i in range(exp_config.grad_accum_steps):  # compute gradients for a single macro-batch
+                sample = next(tr_loader)  # TODO: maybe move getting the next sample to after the forward pass, to overlap better
+                x,y = [el.to(net.device, non_blocking=True) for el in sample]
+                if exp_config.ddp:   # only bother doing sync when doing the very last .backward() before an optimizer step
+                    net.require_backward_grad_sync = ((i+1) % exp_config.grad_accum_steps == 0)
+                batch_loss = net(x, y)[0] / exp_config.grad_accum_steps  # net returns (loss_value, logits) tuple
+                scaler.scale(batch_loss).backward()  # accumulate scaled gradients
+
+            scaler.unscale_(optimizer)  # unscale so that we can clip propely
+            torch.nn.utils.clip_grad_norm_(net.parameters(), exp_config.grad_clip)  # type: ignore
+            scaler.step(optimizer)  # already gradients are unscaled (as they should be), this won't double unscale them
+            scaler.update()  # update scale parameter
+            optimizer.zero_grad(set_to_none=True)  # supposedly better on memory
+            scheduler.step()  # update LR
+
         epoch_time = utils.get_time() - start
-        #rprint("begin eval")
-        #rprint("otpmi has numparams", len(optimizer.param_groups[0]["params"]))
         metrics.evaluate(net, dsets, exp_config, all_metrics)
         curr_iter = scheduler.last_epoch
         short_name_metrics = {f"{split[:2]}_{metric_name[:4]}": result[-1]  # shorten names of metrics for pretty printing

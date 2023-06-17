@@ -28,7 +28,7 @@ cd $PROJECT_DIR
 # prepare the environment, here I am using environment modules, but you could
 # select the method of your choice (but note that code in ~/.bash_profile or
 # ~/.bashrc will not be executed with a new job)
-module purge && module use /h/${USER}/.environment_modules/ && module load pytorch-2-python-3.10-cuda-118 
+module purge && module use /h/${USER}/.environment_modules/ && module load pytorch-nightly
 
 export XDG_RUNTIME_DIR=""
 # log in to wandb
