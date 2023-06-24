@@ -28,7 +28,7 @@ def run_experiment(dsets, proj_name, ckpt_path, exp_config: config_objects.Exper
     #if exp_config.ddp:
         # [print(utils.get_local_rank(), torch.cuda.get_device_properties(n)) for n in range(torch.cuda.device_count())]
     print("model save path is ", ckpt_path)
-    net = network.Transformer(ckpt_path, exp_config, dsets["train"].cfg)
+    net = network.Transformer(ckpt_path, exp_config, dsets["train"].cfg) # type: ignore
 
     assert (exp_config.grad_accum_steps % utils.get_world_size() == 0)
     exp_config.grad_accum_steps //= utils.get_world_size() # can write to config since wandb config is already set?       

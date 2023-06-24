@@ -9,7 +9,8 @@ class ExperimentCfg:
     vec_size: int = 1536
     n_heads: int = 12
     n_layer: int = 12
-    posn_embed_type: str = "embeds"
+    posn_embed_learnable: bool = True
+    posn_embed_type: str = "base"  # must be in ['base', 'relative']
     layer_norm_posn: str = "weird"
     block_size: int = 2048
     flash: bool = True  # whether to use Flash attention or not
@@ -52,12 +53,12 @@ class ExperimentCfg:
     
     def get_dry(self):
         # some defaults that are meant for running a very small network while debugging
-        # return dataclasses.replace(self, vec_size=1280, n_layer=10, n_heads=1, lr_max=2e-4, lr_min=1e-7, block_size=10, batch_size=1,
+        return dataclasses.replace(self, vec_size=128, n_layer=20, n_heads=4, lr_max=2e-4, lr_min=1e-7, block_size=1024, batch_size=2,
+                grad_accum_steps=8, train_steps=2, num_eval=3, dtype="float16", compile=False, zero=False, checkpointing=False,
+                normalizer_type="RMSNorm", rmsnorm_p=0.2, posn_embed_type="relative", flash=False, posn_embed_learnable=False)
+        # return dataclasses.replace(self, 
         #         grad_accum_steps=8, train_steps=2, num_eval=3, dtype="float16", compile=False, zero=False, checkpointing=False,
-        #         normalizer_type="RMSNorm", rmsnorm_p=0.2)
-        return dataclasses.replace(self, 
-                grad_accum_steps=8, train_steps=2, num_eval=3, dtype="float16", compile=False, zero=False, checkpointing=True,
-                normalizer_type="RMSNorm", rmsnorm_p=0.2)
+        #         normalizer_type="RMSNorm", rmsnorm_p=0.2, posn_embed_type="relative", flash=False, posn_embed_learnable=False)
     
 
 @dataclasses.dataclass

@@ -4,7 +4,8 @@ import torch.distributed as dist
 import argparse
 import torch.multiprocessing as mp
 import os
-import torch._dynamo.config
+import torch._dynamo
+# import torch._functorch
 
 # import transformers
 from transforming.train import run_experiment
@@ -14,6 +15,8 @@ from transforming import utils
 
 torch.backends.cuda.matmul.allow_tf32 = True # type: ignore
 torch.backends.cudnn.allow_tf32 = True # type: ignore
+#torch._functorch.config.functionalize_rng_ops=True # type: ignore
+torch._dynamo.config.verbose = True # type: ignore
 
 
 def main(local_rank, args, data_dir):
@@ -26,7 +29,6 @@ def main(local_rank, args, data_dir):
         torch.cuda.set_device(local_rank)  # so that nccl knows we are only using that specific device
         os.environ["LOCAL_RANK"] = str(local_rank)  # so that we can local rank access later (arguably bad design)
     
-    torch._dynamo.config.verbose = True 
     print("hi from proc", utils.get_rank(), "world size is", utils.get_world_size(), torch.cuda.device_count())
     for v in ["NCCL_ALGO", "NCCL_PROTO", "NCCL_BUFFSIZE", "NCCL_SOCKET_NTHREADS", "NCCL_NSOCKS_PERTHREAD"]:
         print(v, os.environ.get(v, "not found"))
@@ -36,17 +38,20 @@ def main(local_rank, args, data_dir):
                             lr_max=2e-4,
                             lr_min=1e-7,
                             block_size=1024,
-                            batch_size=4,
-                            grad_accum_steps=64,
+                            batch_size=3,
+                            grad_accum_steps=88,
                             train_steps=500, # num macro batches
                             num_eval=300,  # num micro batches
                             dtype="float16",
                             compile=True,
                             zero=True,
-                            checkpointing=True,
+                            checkpointing=False,
                             normalizer_type="RMSNorm",
                             rmsnorm_p=0.2,
-                            layer_norm_posn="pre"
+                            layer_norm_posn="pre",
+                            posn_embed_type="relative",
+                            posn_embed_learnable=False,
+                            flash=False,
                             )
     if args.dry:  # if dry run, overwrite config with dry_run config
         exp_config = exp_config.get_dry()
@@ -64,7 +69,7 @@ def main(local_rank, args, data_dir):
     utils.barrier()
 
     run_experiment(datasets, "transformer-experiments-google-1-billion", 
-                   "checkpoint/large-multi-gpu-zero-rmsnorm.ckpt" if not args.dry else "checkpoint/dry.ckpt", 
+                   "checkpoint/large-multi-gpu-zero-relposn.ckpt" if not args.dry else "checkpoint/dry.ckpt", 
                    exp_config, log_wandb=True, extend=0)#9783411, resume_id="mqa0qyio")
 
 
