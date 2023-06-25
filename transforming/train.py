@@ -10,6 +10,7 @@ import numpy as np
 import dataclasses
 import os
 import time
+from torch.profiler import profile, record_function, ProfilerActivity
 
 from . import config_objects
 from . import network
@@ -55,11 +56,18 @@ def run_experiment(dsets, proj_name, ckpt_path, exp_config: config_objects.Exper
             os.environ["MASTER_ADDR"], os.environ["MASTER_PORT"], "bad")
         net = DDP(net, device_ids=[device_id], output_device=device_id)
         # [print(utils.get_local_rank(), torch.cuda.memory_allocated(n)) for n in range(torch.cuda.device_count())]
-    # for sample in dsets["train"].dataloader():
-    #     print(utils.get_rank(), "has", sample[0][0])
-    #     x,y = [el.to(dsets["train"].cfg.device, non_blocking=True) for el in sample]
-    #     print(net(x, y).item())
-    #     return
+    
+
+    # with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
+    #     with record_function("model"):
+    #         for i, sample in enumerate(dsets["train"].dataloader()):
+    #             # print(utils.get_rank(), "has", sample[0][0])
+    #             x,y = [el.to(net.device, non_blocking=True) for el in sample]
+    #             net(x, y)
+    #             if i > 50:
+    #                 break
+    # print(prof.key_averages(group_by_input_shape=True).table(sort_by="self_cpu_time_total", row_limit=10))
+    # return
 
     # #rprint("setting device to", exp_config.device, net.cfg.device)
 

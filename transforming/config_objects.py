@@ -15,7 +15,8 @@ class ExperimentCfg:
     block_size: int = 2048
     flash: bool = True  # whether to use Flash attention or not
     dtype: str = "bfloat16"  # float32, float16, and bfloat16 are supported (for mixed precision)
-    linear_bias: bool = False  # enable/disable biases for all Linear layers
+    linear_bias: bool = False  # enable/disable biases for all MLP Linear layers
+    learnable_unembed: bool = True  # enable/disable having the unembed matrix be seperately learnable from the embedding matrix
     # Normalizer params
     normalizer_bias: bool = False  # enable/disable biases on the normalizer
     normalizer_eps: float = 1e-8   # eps for making sure divide by zero doesn't happen when normalizing
@@ -53,8 +54,8 @@ class ExperimentCfg:
     
     def get_dry(self):
         # some defaults that are meant for running a very small network while debugging
-        return dataclasses.replace(self, vec_size=128, n_layer=20, n_heads=4, lr_max=2e-4, lr_min=1e-7, block_size=1024, batch_size=2,
-                grad_accum_steps=8, train_steps=2, num_eval=3, dtype="float16", compile=False, zero=False, checkpointing=False,
+        return dataclasses.replace(self, vec_size=128, n_layer=1, n_heads=4, lr_max=2e-4, lr_min=1e-7, block_size=1024, batch_size=2,
+                grad_accum_steps=16, train_steps=2, num_eval=3, dtype="float16", compile=False, zero=False, checkpointing=False,
                 normalizer_type="RMSNorm", rmsnorm_p=0.2, posn_embed_type="relative", flash=False, posn_embed_learnable=False)
         # return dataclasses.replace(self, 
         #         grad_accum_steps=8, train_steps=2, num_eval=3, dtype="float16", compile=False, zero=False, checkpointing=False,

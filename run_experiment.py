@@ -38,8 +38,8 @@ def main(local_rank, args, data_dir):
                             lr_max=2e-4,
                             lr_min=1e-7,
                             block_size=1024,
-                            batch_size=3,
-                            grad_accum_steps=88,
+                            batch_size=2,
+                            grad_accum_steps=128,
                             train_steps=500, # num macro batches
                             num_eval=300,  # num micro batches
                             dtype="float16",
@@ -52,6 +52,7 @@ def main(local_rank, args, data_dir):
                             posn_embed_type="relative",
                             posn_embed_learnable=False,
                             flash=False,
+                            learnable_unembed=False
                             )
     if args.dry:  # if dry run, overwrite config with dry_run config
         exp_config = exp_config.get_dry()

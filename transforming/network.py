@@ -104,7 +104,7 @@ class MultiHeadAttention(nn.Module):
         if cfg.posn_embed_type == "relative":  # https://arxiv.org/pdf/1901.02860.pdf
             self.posn_vect_u = nn.Parameter(torch.zeros(1, self.n_heads, 1, self.head_size))
             self.posn_vect_v = nn.Parameter(torch.zeros(1, self.n_heads, 1, self.head_size))
-            self.posn_key_mat = nn.Linear(self.vec_size, self.vec_size)  # W_k,R in their notation
+            self.posn_key_mat = nn.Linear(self.vec_size, self.vec_size, bias=False)  # W_k,R in their notation
 
             if cfg.posn_embed_learnable:  # disable this since we are doing the global_buffers thing
                 raise ValueError("Probably should not combine learnable position embeddings with relative embeddings,"
@@ -139,17 +139,9 @@ class MultiHeadAttention(nn.Module):
                 # posn_vect_u (1, n_head, head_size, 1) @ k (batch, n_head, seq_len, head_size) -> (batch, n_head, seq_len, 1)
                 attn_dots = (q + self.posn_vect_u) @ k.transpose(2,3)
 
-                # (seq_len, vec_size) @ (vec_size, vec_size) -> (vec_size,vec_size)
+                # (seq_len, vec_size) @ (vec_size, vec_size) -> (seq_len, vec_size)
                 # W_{k,R} @ R_{i-j} in the paper
-                # we do the .flip to match the "decreasing" order of position embeddings in the paper (appendix B, defn of Q matrix)
-                
-
-
                 rel_posn = self.posn_key_mat(self.main_transformer.relative_posn_embed[-seq_len:]) # type: ignore
-                # rel_posn = self.posn_key_mat(self.relative_posn_embed[-seq_len:])  # type: ignore
-
-
-
                 # reshape into (1, n_head, head_size, seq_len)
                 # unsqueeze(0) <=> add batch dim <=> apply same "relative" position embeds to all samples in batch
                 rel_posn = rel_posn.T.view(self.n_heads, self.head_size, seq_len).unsqueeze(0)
@@ -244,7 +236,7 @@ class Transformer(nn.Module):
         # lower left triangle (rows = correspond to given location, left/right within a row (cols) = where we are attending to)
         # register_buffer = untrainable parameter, but gets moved onto/off GPU as requested when doing model.to()
         self.register_buffer("causal_mask",
-                            torch.tril(~torch.ones(self.cfg.block_size, self.cfg.block_size, dtype=torch.bool))
+                            ~torch.tril(torch.ones(self.cfg.block_size, self.cfg.block_size, dtype=torch.bool))
                              .reshape(1,1, self.cfg.block_size, self.cfg.block_size))
         
         self.embed = nn.Embedding(self.dset_cfg.vocab_size, self.cfg.vec_size)
@@ -257,7 +249,8 @@ class Transformer(nn.Module):
 
         self.blocks = nn.ModuleList([TransformerBlock(self.cfg, self) for _ in range(self.cfg.n_layer)])
 
-        self.unembed = nn.Linear(self.cfg.vec_size, self.dset_cfg.vocab_size)
+        if self.cfg.learnable_unembed:
+            self.unembed = nn.Linear(self.cfg.vec_size, self.dset_cfg.vocab_size, bias=False)
 
         # set up autocasting
         rprint(utils.get_device_type(), "deiece")
@@ -292,9 +285,13 @@ class Transformer(nn.Module):
                 x = x + self.posn_embed(torch.arange(seq_len, device=self.device)).unsqueeze(0)
 
             for block in self.blocks:
-                x = block(x)
+                x = block(x)  # (batch, seq_len, vec_size)
+            
+            if self.cfg.learnable_unembed:
+                out = self.unembed(x)  # (batch, seq_len, vec_size) @ (vec_size, vocab_size) 
+            else:
+                out = x @ self.embed.weight.T
 
-            out = self.unembed(x)
             if targets is None:  # ie. inference mode, return logits so we can do temperature stuff
                 return out   # F.softmax(out, dim=-1)
             else:  # flatten across batches and positions so that we can compare indices (in `targets`) to distributions (in `out`)
@@ -318,9 +315,8 @@ class Transformer(nn.Module):
         if tokens.dim() == 1:  # account for prompt size 1
             tokens = tokens.unsqueeze(0)
         # => 2*block_size is max generated size
-        done = [False] * tokens.shape[0]
         finished_sentences = []
-        while not all(done):
+        while tokens.shape[0] != 0:
             # unsqueeze to add batch dim, 0 to rm it, -1 to see last posn in sequence
             # print("token shape", tokens.shape)
             logits = self(tokens[:, -self.cfg.block_size:])
@@ -340,11 +336,10 @@ class Transformer(nn.Module):
             # print("tokens shape", tokens.shape)
             for i, sentence in enumerate(tokens):
                 if sentence[-1] == encoder.eos_token or sentence.shape[0] >= 2*self.cfg.block_size:
-                    # print("done with", i, "shape was", sentence.shape)
                     finished_sentences.append(sentence)
-                    done[i] = True
                     tokens = torch.cat([tokens[:i], tokens[i+1:]], dim=0)
-                    # print("all", all(done))
+                    print("done with", i, "shape was", sentence.shape, "overall shape is now", tokens.shape)
+                    print("we continuing?", tokens.shape[0] != 0)
             #print("new shape", tokens.shape, tokens[0, -1], next_token, self.embed.weight.shape)
         return [encoder.decode(sent.squeeze().detach().cpu().numpy()) for sent in finished_sentences]
 
