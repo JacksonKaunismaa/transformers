@@ -50,6 +50,16 @@ class MLPBlock(nn.Module):
 
     def forward(self, x):
         # x -> (batch, seq_len, vec_size)
+        # print("s0", x.norm())
+        # s1 = self.w_1(x)
+        # print("s1", s1.norm())
+        # s2 = self.act_func(s1)
+        # print("s2", s2.norm())
+        # s3 = self.w_2(s2)
+        # print("s3", s3.norm())
+        # s4 = self.dropout(s3)
+        # print("s4", s4.norm())
+        # return s4
         return self.dropout(self.w_2(self.act_func(self.w_1(x))))
 
 
@@ -71,8 +81,11 @@ class CustomNormalizer(nn.Module):
         elif self.norm_type == "RMSNorm":  # mostly from https://github.com/bzhangGo/rmsnorm/blob/master/rmsnorm_torch.py
             norm_selection = x[..., :self.frac_size]  # they do a split, not sure if that's better or worse
             rms_norm = norm_selection.norm(2, dim=-1, keepdim=True) / torch.sqrt(self.frac_size)
+            # print("norm full", x.norm(2, dim=-1, keepdim=True) / np.sqrt(self.width), "norm calc", rms_norm)
+
 
             x_normed = x / (rms_norm + self.eps)
+            # print("after normed", x_normed.norm(), self.scale)
             if self.bias:
                 return x_normed * self.scale + self.bias
             return x_normed * self.scale
@@ -121,6 +134,7 @@ class MultiHeadAttention(nn.Module):
 
     def forward(self, x):
         # x -> (batch, seq_len, vec_size)
+        # print(x.shape)
         batch, seq_len, _ = x.shape
         # print(x.shape)
         # x_head = x.view(batch, seq_len, self.n_heads, self.head_size)
@@ -146,38 +160,51 @@ class MultiHeadAttention(nn.Module):
                 # unsqueeze(0) <=> add batch dim <=> apply same "relative" position embeds to all samples in batch
                 rel_posn = rel_posn.T.view(self.n_heads, self.head_size, seq_len).unsqueeze(0)
                 # (batch, n_head, seq_len, head_size) @ (1, n_head, head_size, seq_len) -> (batch, n_head, seq_len, seq_len)
-                query_posn = (q + self.posn_vect_v) @ rel_posn
-                
-                # if full shape, take advantage of .take speed up
-                if query_posn.shape == self.main_transformer.shift_indices.shape:  # type:ignore
-                    #shifted_posn = torch.take(query_posn, self.main_transformer.shift_indices)  # type: ignore
-                    shifted_posn = torch.take(query_posn, self.main_transformer.shift_indices)  # type: ignore
-                else:  # about 50% slower
-                    row_idx, col_idx = get_variable_index_shifter(seq_len, device=query_posn.device)
-                    shifted_posn = query_posn[..., row_idx, col_idx]
+                with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=False):  # type: ignore
+                    query_posn = (q + self.posn_vect_v).float() @ rel_posn.float()
+                    # object.__setattr__(self, "query_posn", query_posn)
+                    # print("query_posn", query_posn.isinf().sum())
 
-                attn_dots += shifted_posn
+                    # if full shape, take advantage of .take speed up
+                    if query_posn.shape == self.main_transformer.shift_indices.shape:  # type:ignore
+                        #shifted_posn = torch.take(query_posn, self.main_transformer.shift_indices)  # type: ignore
+                        shifted_posn = torch.take(query_posn, self.main_transformer.shift_indices)  # type: ignore
+                    else:  # about 50% slower
+                        row_idx, col_idx = get_variable_index_shifter(seq_len, device=query_posn.device)
+                        shifted_posn = query_posn[..., row_idx, col_idx]
+
+                    attn_dots = attn_dots.float() + shifted_posn
+                    # mask out the future
+                    # object.__setattr__(self, "attn_dots", attn_dots)
+
+                    attn_dots = attn_dots.masked_fill(self.main_transformer.causal_mask[..., :seq_len, :seq_len], -float("inf")) #type: ignore
+
+                    attn_scores = F.softmax(attn_dots / np.sqrt(self.head_size), dim=-1)
+
+                # print("post_attn_dots", attn_dots.isnan().sum(), attn_dots.norm(dim=-2).max())
             else:  # ie. vanilla transformer
                 # q (batch, n_heads, seq_len, head_size) @ k.T (batch, n_heads, head_size, seq_len)
                 attn_dots = q @ k.transpose(2,3)  # attn_dots is (batch, n_heads, seq_len, seq_len)
 
+                # mask out the future
 
-
-            # mask out the future
-            if self.training:
                 attn_dots = attn_dots.masked_fill(self.main_transformer.causal_mask[..., :seq_len, :seq_len], -float("inf")) #type: ignore
-                # attn_dots = attn_dots.masked_fill(self.causal_mask[..., :seq_len, :seq_len], -float("inf")) #type: ignore
 
+                attn_scores = F.softmax(attn_dots / np.sqrt(self.head_size), dim=-1)
+            # print("attn_scores", attn_scores.isnan().sum())
 
-
-            attn_scores = F.softmax(attn_dots / np.sqrt(self.head_size), dim=-1)
             attn_scores = self.attn_dropout(attn_scores)  # attn_scores is (batch, n_heads, seq_len, seq_len)
 
-            attn = attn_scores @ v  # v is (batch, n_heads, seq_len, head_size), attn is (batch, n_heads, seq_len, head_size)
+            # (batch, n_heads, seq_len, seq_len) @ (batch, n_heads, seq_len, head_size) -> (batch, n_head, seq_len, vec_size)
+
+            attn = attn_scores @ v 
+
 
         # transpose first so that the reshape operates on the last 2 dimensions only, stacking heads
         out = self.out(attn.transpose(1,2).reshape(batch, seq_len, self.vec_size))  # (batch, seq_len, vec_size)
+        # print("end mha", out.norm())
         return self.out_dropout(out)
+
 
 class TransformerBlock(nn.Module):
     def __init__(self, cfg, main_transformer: "Transformer"):
@@ -201,8 +228,12 @@ class TransformerBlock(nn.Module):
             x = self.ln1(x + self.mha(x))
             x = self.ln2(x + self.mlp(x))
         elif self.layer_norm_posn == "pre":
+            # print("pre", x.norm(), x.isnan().sum())
             x = x + self.mha(self.ln1(x))
+            # print("post mha", x.norm(), x.isnan().sum())
             x = x + self.mlp(self.ln2(x))
+            # print("post mlp", x.norm(), x.isnan().sum())
+
         else:
             raise NotImplementedError(f"Layer norm posn '{self.layer_norm_posn}' not supported.")
         return x
@@ -282,9 +313,15 @@ class Transformer(nn.Module):
             # rprint("xdev", x.device, "proper_dev", self.device, "posn_embed", self.posn_embed.weight.device)
             x = self.embed(x)
             if self.cfg.posn_embed_type == "base":
-                x = x + self.posn_embed(torch.arange(seq_len, device=self.device)).unsqueeze(0)
+                if self.cfg.posn_embed_learnable:
+                    x = x + self.posn_embed(torch.arange(seq_len, device=self.device)).unsqueeze(0)
+                else:
+                    x = x + self.posn_embed[:seq_len].view(1,seq_len,self.cfg.vec_size) # type: ignore
 
-            for block in self.blocks:
+            for i, block in enumerate(self.blocks):
+                # if i == 1:  #
+                #     return x
+                # print(i, torch.topk(x.flatten().abs(), 5).values, x.norm()) 
                 x = block(x)  # (batch, seq_len, vec_size)
             
             if self.cfg.learnable_unembed:
@@ -329,17 +366,22 @@ class Transformer(nn.Module):
                 probs = F.softmax(logits, dim=-1)  # 0 to select batch, -1 to select last position in sequence
                 # input("about to multinomail")
                 #print("probs shape", probs.shape, probs[:, -1, :].shape)
+                if probs.isnan().any():
+                    print("DETECTED NANs, ABORTING...")
+                    break
                 next_token = torch.multinomial(probs[:, -1, :], 1)
             else:  # argmax, temp 0
                 next_token = logits[:, -1, :].argmax(dim=-1).unsqueeze(0)
             tokens = torch.cat((tokens, next_token), dim=1)  # concat onto seq_len dimension
             # print("tokens shape", tokens.shape)
+            retain = list(range(tokens.shape[0]))
             for i, sentence in enumerate(tokens):
                 if sentence[-1] == encoder.eos_token or sentence.shape[0] >= 2*self.cfg.block_size:
                     finished_sentences.append(sentence)
-                    tokens = torch.cat([tokens[:i], tokens[i+1:]], dim=0)
-                    print("done with", i, "shape was", sentence.shape, "overall shape is now", tokens.shape)
-                    print("we continuing?", tokens.shape[0] != 0)
+                    retain.remove(i)
+                    print("done with", i, "shape was", sentence.shape, "retain is", retain)
+
+            tokens = tokens[retain]
             #print("new shape", tokens.shape, tokens[0, -1], next_token, self.embed.weight.shape)
         return [encoder.decode(sent.squeeze().detach().cpu().numpy()) for sent in finished_sentences]
 
@@ -354,13 +396,13 @@ class Transformer(nn.Module):
 
         if self.cfg.ddp and self.cfg.zero and optim is not None:  # sharded optimizer => need to collate before saving
             rprint("is consolidating")
-            rprint("Has state", optim.state.keys())
+            # rprint("Has state", optim.state.keys())
             rprint("pre consolidate, has num_params", len(optim.param_groups[0]["params"]))
             optim.consolidate_state_dict()
             rprint("post consolidate, rank, has num_params", len(optim.param_groups[0]["params"]))
 
             if utils.get_rank() == 0:
-                rprint("is saving", optim.state_dict().keys())
+                # rprint("is saving", optim.state_dict().keys())
                 rprint("saving num_params", len(optim.state_dict()["param_groups"][0]["params"]))
                 rprint("state_dict device is", optim.state_dict()["state"][0]["exp_avg"].device)
                 save_dict["optim"] = optim.state_dict()  # it transfers shards to CPU first, so GPU mem is fine

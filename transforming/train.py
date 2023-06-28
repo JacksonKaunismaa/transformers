@@ -229,11 +229,15 @@ def train(net, scaler, scheduler, optimizer, exp_config: config_objects.Experime
                         })#, step=curr_iter)  # TODO: fix this for later experiments
             print(epoch_summary)
         #rprint("checking whether to save, best was", non_ddp_net.best_loss, "last loss was", all_metrics["loss"]["eval"][-1])
-        if all_metrics["loss"]["eval"][-1] < non_ddp_net.best_loss:  # maybe dont save every epoch if loss improves?
+        if all_metrics["loss"]["eval"][-1] < non_ddp_net.best_loss or all_metrics["loss"]["eval"][-1].isnan().any(): # type: ignore  
             non_ddp_net.best_loss = all_metrics["loss"]["eval"][-1]
             # if utils.get_rank() == 0:  # put rank check here so that all ranks have consistent .best_loss
             # need to disable the rank check here since sharded optimizer requires all ranks to consolidate
             non_ddp_net.save_model_state_dict(scaler=scaler, optim=optimizer, sched=scheduler)
+            # ie. save the nan model, but stop training
+            if all_metrics["loss"]["eval"][-1].isnan().any():  # type: ignore
+                print("detected nan failure, aborting training...")
+                return
                 # utils.barrier()  # wrapper around dist.barrier() that is a no-op if no ddp
                 
             

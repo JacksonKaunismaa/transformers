@@ -5,6 +5,7 @@ import argparse
 import torch.multiprocessing as mp
 import os
 import torch._dynamo
+import logging
 # import torch._functorch
 
 # import transformers
@@ -17,6 +18,7 @@ torch.backends.cuda.matmul.allow_tf32 = True # type: ignore
 torch.backends.cudnn.allow_tf32 = True # type: ignore
 #torch._functorch.config.functionalize_rng_ops=True # type: ignore
 torch._dynamo.config.verbose = True # type: ignore
+# torch._dynamo.config.log_level = logging.INFO # type: ignore
 
 
 def main(local_rank, args, data_dir):
@@ -52,7 +54,8 @@ def main(local_rank, args, data_dir):
                             posn_embed_type="relative",
                             posn_embed_learnable=False,
                             flash=False,
-                            learnable_unembed=False
+                            learnable_unembed=False,
+                            job_id=args.id
                             )
     if args.dry:  # if dry run, overwrite config with dry_run config
         exp_config = exp_config.get_dry()
@@ -60,7 +63,7 @@ def main(local_rank, args, data_dir):
     exp_config.ddp = local_rank is not None
 
     dset_config = DatasetCfg(dataset_path=data_dir,
-                            num_workers=args.num_workers
+                            num_workers=args.num_workers,
                             )
 
     datasets = dict(train=IdxDataset("train.bin", exp_config, dset_config),
@@ -70,8 +73,8 @@ def main(local_rank, args, data_dir):
     utils.barrier()
 
     run_experiment(datasets, "transformer-experiments-google-1-billion", 
-                   "checkpoint/large-multi-gpu-zero-relposn.ckpt" if not args.dry else "checkpoint/dry.ckpt", 
-                   exp_config, log_wandb=True, extend=0)#9783411, resume_id="mqa0qyio")
+                   "checkpoint/large-multi-gpu-zero-relposn-cheater.ckpt" if not args.dry else "checkpoint/dry.ckpt", 
+                   exp_config, log_wandb=True, extend=9890529, resume_id="6ng56xyq")
 
 
 if __name__ == "__main__":
@@ -84,6 +87,7 @@ if __name__ == "__main__":
     parser.add_argument('--local-world-size', default=1, type=int, help="all gpu processes")
     parser.add_argument('--nnodes', default=1, type=int, help="number of compute-nodes (local_world_size * nnodes = world_size)")
     parser.add_argument('--dry', action="store_true", help="set this flag to run with a very small network, for debugging purposes")
+    parser.add_argument('--id', default=0, type=int, help="Slurm job id (for true location of checkpoint)")
     args = parser.parse_args()
     print(args)
     if args.nnodes > 1 or args.local_world_size > 1:

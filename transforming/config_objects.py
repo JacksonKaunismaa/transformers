@@ -49,6 +49,9 @@ class ExperimentCfg:
     zero: bool = False  # whether or not to use ZeroRedundancyOptimizer (only if ddp set)
     checkpointing: bool = False  # whether or not to use activation checkpointing
 
+    # Misc.
+    job_id: int = 0  # slurm job id / true location of checkpoint
+
     def __hash__(self):
         return hash(str(self))
     
