@@ -47,7 +47,8 @@ class ExperimentCfg:
     compile: bool = False # whether or not to compile the model
     ddp: bool = False   # whether or not to use DistributedDataParallel
     zero: bool = False  # whether or not to use ZeroRedundancyOptimizer (only if ddp set)
-    checkpointing: bool = False  # whether or not to use activation checkpointing
+    checkpointing: bool = False   # whether or not to use activation checkpointing
+    label_smoothing: float = 1e-8  # amount of label smoothing to use
 
     # Misc.
     job_id: int = 0  # slurm job id / true location of checkpoint

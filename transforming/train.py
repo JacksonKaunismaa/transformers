@@ -226,7 +226,7 @@ def train(net, scaler, scheduler, optimizer, exp_config: config_objects.Experime
                         "tok_time": epoch_time/epoch_tokens,
                         "rand_sentences": wandb.Table(columns=["step", "sentence"], data=rand_sentences),
                         "step": curr_iter
-                        })#, step=curr_iter)  # TODO: fix this for later experiments
+                        })#, step=curr_iter)  # TODO: fix this for future projectss
             print(epoch_summary)
         #rprint("checking whether to save, best was", non_ddp_net.best_loss, "last loss was", all_metrics["loss"]["eval"][-1])
         if all_metrics["loss"]["eval"][-1] < non_ddp_net.best_loss or all_metrics["loss"]["eval"][-1].isnan().any(): # type: ignore  

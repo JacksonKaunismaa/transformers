@@ -49,7 +49,7 @@ def main(local_rank, args, data_dir):
                             zero=True,
                             checkpointing=False,
                             normalizer_type="RMSNorm",
-                            rmsnorm_p=0.2,
+                            rmsnorm_p=0.1,
                             layer_norm_posn="pre",
                             posn_embed_type="relative",
                             posn_embed_learnable=False,
@@ -64,6 +64,7 @@ def main(local_rank, args, data_dir):
 
     dset_config = DatasetCfg(dataset_path=data_dir,
                             num_workers=args.num_workers,
+                            chunk_size=20
                             )
 
     datasets = dict(train=IdxDataset("train.bin", exp_config, dset_config),
@@ -73,8 +74,8 @@ def main(local_rank, args, data_dir):
     utils.barrier()
 
     run_experiment(datasets, "transformer-experiments-google-1-billion", 
-                   "checkpoint/large-multi-gpu-zero-relposn-cheater.ckpt" if not args.dry else "checkpoint/dry.ckpt", 
-                   exp_config, log_wandb=True, extend=9890529, resume_id="6ng56xyq")
+                   "checkpoint/large-multi-gpu-zero-relposn-smooth.ckpt" if not args.dry else "checkpoint/dry.ckpt", 
+                   exp_config, log_wandb=True, extend=0)#, resume_id="6ng56xyq")
 
 
 if __name__ == "__main__":

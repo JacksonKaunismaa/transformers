@@ -162,7 +162,6 @@ class MultiHeadAttention(nn.Module):
                 # (batch, n_head, seq_len, head_size) @ (1, n_head, head_size, seq_len) -> (batch, n_head, seq_len, seq_len)
                 with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=False):  # type: ignore
                     query_posn = (q + self.posn_vect_v).float() @ rel_posn.float()
-                    # object.__setattr__(self, "query_posn", query_posn)
                     # print("query_posn", query_posn.isinf().sum())
 
                     # if full shape, take advantage of .take speed up
@@ -172,14 +171,17 @@ class MultiHeadAttention(nn.Module):
                     else:  # about 50% slower
                         row_idx, col_idx = get_variable_index_shifter(seq_len, device=query_posn.device)
                         shifted_posn = query_posn[..., row_idx, col_idx]
+                    # object.__setattr__(self, "shifted_posn", shifted_posn)
 
                     attn_dots = attn_dots.float() + shifted_posn
                     # mask out the future
                     # object.__setattr__(self, "attn_dots", attn_dots)
 
                     attn_dots = attn_dots.masked_fill(self.main_transformer.causal_mask[..., :seq_len, :seq_len], -float("inf")) #type: ignore
-
+                    # print("attn_dots", attn_dots.isnan().sum())
                     attn_scores = F.softmax(attn_dots / np.sqrt(self.head_size), dim=-1)
+                    # print("attn_scores", attn_dots.isnan().sum())
+
 
                 # print("post_attn_dots", attn_dots.isnan().sum(), attn_dots.norm(dim=-2).max())
             else:  # ie. vanilla transformer
@@ -334,7 +336,8 @@ class Transformer(nn.Module):
             else:  # flatten across batches and positions so that we can compare indices (in `targets`) to distributions (in `out`)
                 #print(out, targets)
                 #print(F.cross_entropy(out.view(-1, self.dset_cfg.vocab_size), targets.view(-1)))
-                return F.cross_entropy(out.view(-1, self.dset_cfg.vocab_size), targets.view(-1)), out
+                loss = F.cross_entropy(out.view(-1, self.dset_cfg.vocab_size), targets.view(-1), label_smoothing=self.cfg.label_smoothing)
+                return loss, out
 
     @torch.no_grad()  # batched sampling
     def generate(self, encoder, prompt: Union[str, List[int], torch.Tensor], temperature=0.2) -> List[str]:
@@ -361,15 +364,26 @@ class Transformer(nn.Module):
             if temperature > 0:
                 #print(logits[:, -1, :].shape)
                 # input("about to div temp")
+                # print("logits", logits[0, -1].isinf().sum())
                 logits[:, -1, :] /= temperature
                 # input("about to softm")
+                # print("logits", logits[0, -1])
                 probs = F.softmax(logits, dim=-1)  # 0 to select batch, -1 to select last position in sequence
+                # print("probs", probs[0,-1])
+
                 # input("about to multinomail")
                 #print("probs shape", probs.shape, probs[:, -1, :].shape)
                 if probs.isnan().any():
-                    print("DETECTED NANs, ABORTING...")
-                    break
-                next_token = torch.multinomial(probs[:, -1, :], 1)
+                    if logits[:, -1, :].isnan().any():
+                        print("DETECTED NANs, ABORTING...")
+                        for sentence in tokens:
+                            finished_sentences.append(sentence)
+                        break
+                    else:
+                        print("DETECTED NANs, DOING ARGMAX BACKUP...")
+                        next_token = logits[:, -1, :].argmax(dim=-1).unsqueeze(0)
+                else:
+                    next_token = torch.multinomial(probs[:, -1, :], 1)
             else:  # argmax, temp 0
                 next_token = logits[:, -1, :].argmax(dim=-1).unsqueeze(0)
             tokens = torch.cat((tokens, next_token), dim=1)  # concat onto seq_len dimension
@@ -481,18 +495,6 @@ class Transformer(nn.Module):
                     # use_reentrant=False since then we can do do autograd.grad() (more features in general are supported)
                     return ckpt.checkpoint(orig_forward, *inputs, preserve_rng_state=False, use_reentrant=False)
                 module.forward = checkpoint_fwd  # type: ignore
-
-        # def add_checkpointing(mod):
-            # def save_inpt_hook(layer, inpt):  # save the input so that the ckpt.checkpoint knows what inpt is
-            #     self._inputs[curr_name] = inpt
-            # def free_inpt_hook(layer, inpt, outpt):  # free the memory after so we don't waste space in the _inputs dict
-            #     self._inputs[curr_name] = None # mark memory as free
-                # mod.register_forward_pre_hook(save_inpt_hook)  # register hooks so input is available to the ckpt.checkpoint
-                # mod.register_forward_hook(free_inpt_hook)
-                # replace forward with checkpointed version
-
-                # mod.forward = checkpoint_fwd(mod)#ckpt.checkpoint(mod.forward, self._inputs[curr_name]) # type: ignore
-
         utils.traverse_modules(add_checkpointing, self)
 
     @property  # so that it works through a .to
