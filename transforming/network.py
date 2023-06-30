@@ -495,26 +495,33 @@ class Transformer(nn.Module):
                     # use_reentrant=False since then we can do do autograd.grad() (more features in general are supported)
                     return ckpt.checkpoint(orig_forward, *inputs, preserve_rng_state=False, use_reentrant=False)
                 module.forward = checkpoint_fwd  # type: ignore
+
         utils.traverse_modules(add_checkpointing, self)
+        # to get model vram, you need to do looped waiting
+        # for speed-wise on small, estimates were smoothed with gamma=0.999, sampled at the last step where all are available
+        # for small sizes (batch=1, seq_len=10, heads=1, layers=10, vec_size=1280)
+            # memory-wise
+                # model only (12.5), baseline (57.04), traverse (57.04), GeLU+Norm (57.04), MHA+MLP+GeLU+Norm (56.41), blocks (56.4)
+                # traverse <=> manually doing it on the respective operations (57.04 vs. 57.04)
+                # checkpointing on GeLU and Normalizer saves almost nothing compared to baseline
+                # checkpointing on whole blocks <=> checkpointing on all of MHA, MLP, GeLU, Normalizer
+            # speed-wise
+                # baseline (7.22e-3), GeLU+Norm (7.31e-3), traverse (7.34e-3), MHA+MLP+GeLU+Norm (8.04e-3), blocks (8.90e-3)
+                # its very close, but traverse <=> manually doing it (7.22e-3 vs 7.31e-3)
+                # checkpointing on blocks is slowest (8.90e-3 tok_time)
+                # checkpointing whole blocks is slower than checkpointing all of MHA, MLP, GeLU, Normalizer (8.90e-3 vs. 8.04e-3)
+        # for large sizes (batch=4, seq_len=1024, heads=12, layers=12, vec_size=1536)
+            # memory-wise
+                # model only (14.6), baseline (90.27), GeLu+Normalizer (86.54), traverse (86.46), blocks (84.38)
+                # traverse is very slightly better than specifying on GeLU and normalizer (86.54 vs. 86.46)
+                # traverse saves about ~3.5% memory usage, blocks saves about double that (~6%)
+            # speed-wise
+                # baseline (1.96e-4), GeLU+Normalizer (1.99e-4), traverse (2.01e-4), blocks (2.60e-4)
+                # traverse <=> GeLU+Normalizer (2.008e-4 vs 1.993e-4)
+                # full blocks is significantly slower ~25% (2.60e-4 vs 1.96e-4)
+                # traverse very close to no checkpointing (2.008e-4 vs 1.960e-4)
 
     @property  # so that it works through a .to
     def device(self):
         return self.embed.weight.device
-
-
-# class OptimizerState():  # if there is one more thing, ill consider actually implementing something like this
-#     def __init__(self, scheduler, scaler, optimizer):
-#         self.optim = optimizer
-#         self.sched = scheduler
-#         self.scaler = scaler
-
-#     def state_dict(self):
-#         save_dict = {}
-#         for key,obj in self.items():
-#           save_dict[key] = obj.state_dict()
-
-#     def load_state_dict(self, state_dict):
-#           for key,obj in self.items():
-#               obj.load_state_dict(state_dict[key])
-
 
