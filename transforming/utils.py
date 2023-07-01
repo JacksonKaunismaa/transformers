@@ -69,7 +69,7 @@ def sample_random_start_word(dset, window_size):   # for generating the samples 
 # sample generate a bunch of sentences using random start words
 def sample_random_sentences(net, dsets, exp_config, num_sample=5, temperature=0.2):
     start_tokens = [sample_random_start_word(dsets["eval"], 20*exp_config.block_size) for _ in range(num_sample)]
-    stacked_tokens = torch.from_numpy(np.asarray(start_tokens)).unsqueeze(-1).to(net.device)  # (num_samples, 1)
+    stacked_tokens = torch.tensor(start_tokens).unsqueeze(-1).to(net.device)  # (num_samples, 1)
     # print("found start tokens", start_tokens, dsets["eval"].encoder.decode(start_tokens))
     return net.generate(dsets["eval"].encoder, stacked_tokens, temperature=temperature) 
 

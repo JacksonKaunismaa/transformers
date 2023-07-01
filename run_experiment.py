@@ -52,7 +52,6 @@ def main(local_rank, args, data_dir):
                             rmsnorm_p=0.1,
                             layer_norm_posn="pre",
                             posn_embed_type="relative",
-                            posn_embed_learnable=False,
                             flash=False,
                             learnable_unembed=False,
                             job_id=args.id
@@ -75,7 +74,7 @@ def main(local_rank, args, data_dir):
 
     run_experiment(datasets, "transformer-experiments-google-1-billion", 
                    "checkpoint/large-multi-gpu-zero-relposn-smooth.ckpt" if not args.dry else "checkpoint/dry.ckpt", 
-                   exp_config, log_wandb=True, extend=0)#, resume_id="6ng56xyq")
+                   exp_config, log_wandb=True, extend=9898689, resume_id="uax7f0am")
 
 
 if __name__ == "__main__":

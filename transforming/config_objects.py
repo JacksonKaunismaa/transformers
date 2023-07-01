@@ -9,8 +9,9 @@ class ExperimentCfg:
     vec_size: int = 1536
     n_heads: int = 12
     n_layer: int = 12
-    posn_embed_learnable: bool = True
-    posn_embed_type: str = "base"  # must be in ['base', 'relative']
+    posn_embed_type: str = "base"  # must be in ['base_sinusoid', 'base_learnable', 'relative', 'none', 'rel_bias']
+    rel_posn_bias_max_posn: int = 128  # only has effect if posn_embed_type == "relative"
+    rel_posn_bias_num_buckets: int = 32  # only has effect if posn_embed_type == "relative"
     layer_norm_posn: str = "weird"
     block_size: int = 2048
     flash: bool = True  # whether to use Flash attention or not

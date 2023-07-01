@@ -28,6 +28,7 @@ def run_experiment(dsets, proj_name, ckpt_path, exp_config: config_objects.Exper
 
     #if exp_config.ddp:
         # [print(utils.get_local_rank(), torch.cuda.get_device_properties(n)) for n in range(torch.cuda.device_count())]
+    ckpt_path = osp.realpath(ckpt_path)
     print("model save path is ", ckpt_path)
     net = network.Transformer(ckpt_path, exp_config, dsets["train"].cfg) # type: ignore
 
@@ -76,7 +77,7 @@ def run_experiment(dsets, proj_name, ckpt_path, exp_config: config_objects.Exper
 
     if extend:  # set extend to the slurm job id of the run that generated it so we can acces the checkpoint
         map_location = device  # make sure we load to the right device
-        actual_ckpt_dir = osp.dirname(osp.realpath(ckpt_path))
+        actual_ckpt_dir = osp.dirname(ckpt_path)
         old_ckpt_dir = osp.join(osp.dirname(actual_ckpt_dir), str(extend))  # go into the different job id's checkpoint dir
         old_ckpt_path = osp.join(old_ckpt_dir, osp.basename(ckpt_path))
         load_success = utils.get_raw(net).load_model_state_dict(map_location, path=old_ckpt_path, 

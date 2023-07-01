@@ -38,6 +38,38 @@ def get_variable_index_shifter(seq_len, device):
     row_idx = torch.arange(seq_len, device=device)[:,None]
     return row_idx, col_idx
 
+def get_rel_bias_indices(block_size, max_distance, num_buckets):
+    # adapted from https://github.com/huggingface/transformers/blob/v4.30.0/src/transformers/models/t5/modeling_t5.py#L388
+    context_position = torch.arange(block_size, dtype=torch.long)[:, None]
+    memory_position = torch.arange(block_size, dtype=torch.long )[None, :]
+    relative_position = memory_position - context_position
+
+    # elementwise minimum, basically zeroes out upper right triangle
+    relative_position = -torch.min(relative_position, torch.zeros_like(relative_position)) 
+    # now relative_position is in the range [0, inf)
+
+    # half of the buckets are for single increment
+    max_exact = num_buckets // 2
+    is_small = relative_position < max_exact
+
+    # The other half of the buckets are for logarithmically bigger bins in positions up to max_distance
+    # seq_len - max_exact is the num of positions we have for the log-bins
+    # but we only want to go up to position max_distance
+    relative_position_if_large = max_exact + (
+        torch.log(relative_position.float() / max_exact)   # ie. log(rel_posn) - log(max_exact)
+        / np.log(max_distance / max_exact)  # ie. log(max_distance) - log(max_exact) => at posn max_distance the log -> 1
+        * (num_buckets - max_exact)   # so that now at max_distance the log is num_buckets - max_exact
+    ).long()
+
+    # ie. basically set stuff past max_position to num_buckets-1
+    # set anything that went past num_buckets to num_buckets-1
+     # we are definietly "large" out here, so it makes sense
+    relative_position_if_large = torch.min(      
+        relative_position_if_large, torch.full_like(relative_position_if_large, num_buckets - 1) 
+    )
+                                                                               
+    return torch.where(is_small, relative_position, relative_position_if_large)
+
 
 
 class MLPBlock(nn.Module):
@@ -83,7 +115,6 @@ class CustomNormalizer(nn.Module):
             rms_norm = norm_selection.norm(2, dim=-1, keepdim=True) / torch.sqrt(self.frac_size)
             # print("norm full", x.norm(2, dim=-1, keepdim=True) / np.sqrt(self.width), "norm calc", rms_norm)
 
-
             x_normed = x / (rms_norm + self.eps)
             # print("after normed", x_normed.norm(), self.scale)
             if self.bias:
@@ -109,21 +140,15 @@ class MultiHeadAttention(nn.Module):
         object.__setattr__(self, "main_transformer", main_transformer)  # save this so we can access the needed buffers
 
 
-        if cfg.flash and cfg.posn_embed_type != "base":
+        if cfg.flash and cfg.posn_embed_type not in ["base_sinusoid", "base_learnable", "none"]:
             raise ValueError(f"Flash attention is currently incompatible with posn_embed type '{cfg.posn_embed_type}'."
-                             f" Flash attention only supports posn_embed_type == 'base'")
+                             f" Flash attention only supports posn_embed_type in ['base_sinusoid', 'base_learnable', 'none']")
 
 
         if cfg.posn_embed_type == "relative":  # https://arxiv.org/pdf/1901.02860.pdf
             self.posn_vect_u = nn.Parameter(torch.zeros(1, self.n_heads, 1, self.head_size))
             self.posn_vect_v = nn.Parameter(torch.zeros(1, self.n_heads, 1, self.head_size))
             self.posn_key_mat = nn.Linear(self.vec_size, self.vec_size, bias=False)  # W_k,R in their notation
-
-            if cfg.posn_embed_learnable:  # disable this since we are doing the global_buffers thing
-                raise ValueError("Probably should not combine learnable position embeddings with relative embeddings,"
-                                 " since the sinusoid one uses a learnable matrix anyway")
-                #self.relative_posn_embed = nn.Linear(cfg.block_size, cfg.vec_size)
-
 
         self.qkv = nn.Linear(self.vec_size, 3*self.vec_size, bias=False)
         self.out = nn.Linear(self.vec_size, self.vec_size, bias=False)
@@ -138,7 +163,6 @@ class MultiHeadAttention(nn.Module):
         batch, seq_len, _ = x.shape
         # print(x.shape)
         # x_head = x.view(batch, seq_len, self.n_heads, self.head_size)
-
         qkv = torch.split(self.qkv(x), self.vec_size, dim=-1)  # q,k,v are (batch, seq_len, vec_size)
         # transpose so that multiplications are done to each position, not each head
         # q,k,v are now (batch, n_head, seq_len, head_size)
@@ -159,52 +183,39 @@ class MultiHeadAttention(nn.Module):
                 # reshape into (1, n_head, head_size, seq_len)
                 # unsqueeze(0) <=> add batch dim <=> apply same "relative" position embeds to all samples in batch
                 rel_posn = rel_posn.T.view(self.n_heads, self.head_size, seq_len).unsqueeze(0)
-                # (batch, n_head, seq_len, head_size) @ (1, n_head, head_size, seq_len) -> (batch, n_head, seq_len, seq_len)
-                with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=False):  # type: ignore
-                    query_posn = (q + self.posn_vect_v).float() @ rel_posn.float()
-                    # print("query_posn", query_posn.isinf().sum())
+                # force running in float32 here to avoid numerical instability issues
+                with torch.autocast(device_type=utils.get_device_type(), enabled=False): # type: ignore
+                    # (batch, n_head, seq_len, head_size) @ (1, n_head, head_size, seq_len) -> (batch, n_head, seq_len, seq_len)
+                    query_posn = (q + self.posn_vect_v) @ rel_posn.float()
 
                     # if full shape, take advantage of .take speed up
                     if query_posn.shape == self.main_transformer.shift_indices.shape:  # type:ignore
-                        #shifted_posn = torch.take(query_posn, self.main_transformer.shift_indices)  # type: ignore
                         shifted_posn = torch.take(query_posn, self.main_transformer.shift_indices)  # type: ignore
                     else:  # about 50% slower
                         row_idx, col_idx = get_variable_index_shifter(seq_len, device=query_posn.device)
                         shifted_posn = query_posn[..., row_idx, col_idx]
                     # object.__setattr__(self, "shifted_posn", shifted_posn)
-
-                    attn_dots = attn_dots.float() + shifted_posn
-                    # mask out the future
+                    attn_dots = attn_dots + shifted_posn
                     # object.__setattr__(self, "attn_dots", attn_dots)
 
-                    attn_dots = attn_dots.masked_fill(self.main_transformer.causal_mask[..., :seq_len, :seq_len], -float("inf")) #type: ignore
-                    # print("attn_dots", attn_dots.isnan().sum())
-                    attn_scores = F.softmax(attn_dots / np.sqrt(self.head_size), dim=-1)
-                    # print("attn_scores", attn_dots.isnan().sum())
-
-
-                # print("post_attn_dots", attn_dots.isnan().sum(), attn_dots.norm(dim=-2).max())
+            elif self.posn_embed_type == "rel_bias":
+                rel_bias = self.main_transformer.rel_bias(self.main_transformer.rel_bias_indices[:seq_len, :seq_len]) # type:ignore
+                rel_bias = rel_bias.permute([2, 0, 1]).unsqueeze(0)
+                attn_dots = q @ k.transpose(2, 3) + rel_bias
             else:  # ie. vanilla transformer
                 # q (batch, n_heads, seq_len, head_size) @ k.T (batch, n_heads, head_size, seq_len)
                 attn_dots = q @ k.transpose(2,3)  # attn_dots is (batch, n_heads, seq_len, seq_len)
 
-                # mask out the future
-
-                attn_dots = attn_dots.masked_fill(self.main_transformer.causal_mask[..., :seq_len, :seq_len], -float("inf")) #type: ignore
-
-                attn_scores = F.softmax(attn_dots / np.sqrt(self.head_size), dim=-1)
-            # print("attn_scores", attn_scores.isnan().sum())
-
+            # mask out the future
+            attn_dots = attn_dots.masked_fill(self.main_transformer.causal_mask[..., :seq_len, :seq_len], -float("inf")) #type: ignore
+            attn_scores = F.softmax(attn_dots / np.sqrt(self.head_size), dim=-1)
             attn_scores = self.attn_dropout(attn_scores)  # attn_scores is (batch, n_heads, seq_len, seq_len)
 
             # (batch, n_heads, seq_len, seq_len) @ (batch, n_heads, seq_len, head_size) -> (batch, n_head, seq_len, vec_size)
-
-            attn = attn_scores @ v 
-
+            attn = attn_scores @ v
 
         # transpose first so that the reshape operates on the last 2 dimensions only, stacking heads
         out = self.out(attn.transpose(1,2).reshape(batch, seq_len, self.vec_size))  # (batch, seq_len, vec_size)
-        # print("end mha", out.norm())
         return self.out_dropout(out)
 
 
@@ -253,7 +264,7 @@ class Transformer(nn.Module):
         self.initialize_architecture()  # uses saved cfg to make the layers
 
     def initialize_architecture(self):
-        assert self.cfg.posn_embed_type in ["base", "relative"]
+        assert self.cfg.posn_embed_type in ["base_sinusoid", "base_learnable", "relative", "none", "rel_bias"]
 
 
         if self.cfg.posn_embed_type == "relative":  # register these only once to save memory
@@ -265,6 +276,11 @@ class Transformer(nn.Module):
             # of shift_col_indices and shift_row_indices, which is still faster than the original XL transformer
             # implementation, but allows indexing for variable length inputs
             self.register_buffer("shift_indices", get_index_shifter(self.cfg.block_size, self.cfg.batch_size, self.cfg.n_heads))
+        elif self.cfg.posn_embed_type == "rel_bias":
+            self.rel_bias = nn.Embedding(self.cfg.block_size, self.cfg.n_heads)
+            self.register_buffer("rel_bias_indices", get_rel_bias_indices(self.cfg.block_size,
+                                                                          self.cfg.rel_posn_bias_max_posn,
+                                                                          self.cfg.rel_posn_bias_num_buckets))
 
         # lower left triangle (rows = correspond to given location, left/right within a row (cols) = where we are attending to)
         # register_buffer = untrainable parameter, but gets moved onto/off GPU as requested when doing model.to()
@@ -274,11 +290,10 @@ class Transformer(nn.Module):
         
         self.embed = nn.Embedding(self.dset_cfg.vocab_size, self.cfg.vec_size)
 
-        if self.cfg.posn_embed_type == "base":
-            if self.cfg.posn_embed_learnable:  # learnable position embeddings rather than sin waves
-                self.posn_embed = nn.Embedding(self.cfg.block_size, self.cfg.vec_size)
-            else:
-                self.register_buffer("posn_embed", sinusoid_matrix(self.cfg.block_size, self.cfg.vec_size))
+        if self.cfg.posn_embed_type == "base_learnable":
+            self.posn_embed = nn.Embedding(self.cfg.block_size, self.cfg.vec_size)
+        elif self.cfg.posn_embed_type == "base_sinusoid":
+            self.register_buffer("posn_embed", sinusoid_matrix(self.cfg.block_size, self.cfg.vec_size))
 
         self.blocks = nn.ModuleList([TransformerBlock(self.cfg, self) for _ in range(self.cfg.n_layer)])
 
@@ -314,11 +329,10 @@ class Transformer(nn.Module):
             _, seq_len = x.shape  # not strictly "correct" since we sort of cut sequences up so position embeddings are wrong here
             # rprint("xdev", x.device, "proper_dev", self.device, "posn_embed", self.posn_embed.weight.device)
             x = self.embed(x)
-            if self.cfg.posn_embed_type == "base":
-                if self.cfg.posn_embed_learnable:
-                    x = x + self.posn_embed(torch.arange(seq_len, device=self.device)).unsqueeze(0)
-                else:
-                    x = x + self.posn_embed[:seq_len].view(1,seq_len,self.cfg.vec_size) # type: ignore
+            if self.cfg.posn_embed_type == "base_learnable":
+                x = x + self.posn_embed(torch.arange(seq_len, device=self.device)).unsqueeze(0) # type: ignore
+            elif self.cfg.posn_embed_type == "base_sinusoid":
+                x = x + self.posn_embed[:seq_len].unsqueeze(0) # type: ignore
 
             for i, block in enumerate(self.blocks):
                 # if i == 1:  #
@@ -358,21 +372,11 @@ class Transformer(nn.Module):
         finished_sentences = []
         while tokens.shape[0] != 0:
             # unsqueeze to add batch dim, 0 to rm it, -1 to see last posn in sequence
-            # print("token shape", tokens.shape)
             logits = self(tokens[:, -self.cfg.block_size:])
-            # print("logit shape", logits.shape)
             if temperature > 0:
-                #print(logits[:, -1, :].shape)
-                # input("about to div temp")
-                # print("logits", logits[0, -1].isinf().sum())
                 logits[:, -1, :] /= temperature
-                # input("about to softm")
-                # print("logits", logits[0, -1])
                 probs = F.softmax(logits, dim=-1)  # 0 to select batch, -1 to select last position in sequence
-                # print("probs", probs[0,-1])
 
-                # input("about to multinomail")
-                #print("probs shape", probs.shape, probs[:, -1, :].shape)
                 if probs.isnan().any():
                     if logits[:, -1, :].isnan().any():
                         print("DETECTED NANs, ABORTING...")
@@ -381,13 +385,13 @@ class Transformer(nn.Module):
                         break
                     else:
                         print("DETECTED NANs, DOING ARGMAX BACKUP...")
-                        next_token = logits[:, -1, :].argmax(dim=-1).unsqueeze(0)
+                        next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
                 else:
                     next_token = torch.multinomial(probs[:, -1, :], 1)
             else:  # argmax, temp 0
-                next_token = logits[:, -1, :].argmax(dim=-1).unsqueeze(0)
+                next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+
             tokens = torch.cat((tokens, next_token), dim=1)  # concat onto seq_len dimension
-            # print("tokens shape", tokens.shape)
             retain = list(range(tokens.shape[0]))
             for i, sentence in enumerate(tokens):
                 if sentence[-1] == encoder.eos_token or sentence.shape[0] >= 2*self.cfg.block_size:
@@ -396,8 +400,7 @@ class Transformer(nn.Module):
                     print("done with", i, "shape was", sentence.shape, "retain is", retain)
 
             tokens = tokens[retain]
-            #print("new shape", tokens.shape, tokens[0, -1], next_token, self.embed.weight.shape)
-        return [encoder.decode(sent.squeeze().detach().cpu().numpy()) for sent in finished_sentences]
+        return [encoder.decode(sent.detach().cpu().numpy()) for sent in finished_sentences]
 
     def save_model_state_dict(self, optim=None, path=None, **kwargs):  # kwargs should contain optimizer,scheduler, and scaler
         if path is None:
