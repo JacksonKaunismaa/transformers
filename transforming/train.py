@@ -191,6 +191,7 @@ def train(net, scaler, scheduler, optimizer, exp_config: config_objects.Experime
                     exp_config.batch_size * exp_config.block_size * exp_config.train_steps  # num tokens in an "epoch"
 
     rprint("Num tokens in an epoch:", epoch_tokens)
+    rprint("Effective tokens per batch:", epoch_tokens//exp_config.train_steps)
 
     # all_sentences = []  # do this entirely in python since wandb really hates being able to update artifacts
     # sentence_artifact_name = "rand_sentences{}"  # do this since it would probably be too much io sadly
