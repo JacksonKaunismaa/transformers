@@ -190,6 +190,8 @@ def train(net, scaler, scheduler, optimizer, exp_config: config_objects.Experime
     epoch_tokens = exp_config.grad_accum_steps * utils.get_world_size() * \
                     exp_config.batch_size * exp_config.block_size * exp_config.train_steps  # num tokens in an "epoch"
 
+    rprint("Num tokens in an epoch:", epoch_tokens)
+
     # all_sentences = []  # do this entirely in python since wandb really hates being able to update artifacts
     # sentence_artifact_name = "rand_sentences{}"  # do this since it would probably be too much io sadly
     # sentence_batch = 
@@ -228,7 +230,7 @@ def train(net, scaler, scheduler, optimizer, exp_config: config_objects.Experime
                 rand_sentences = [[curr_iter, sent] for sent in utils.sample_random_sentences(non_ddp_net, dsets, exp_config)]
                 wandb.log({**short_name_metrics,
                         "lr": optimizer.param_groups[0]["lr"],
-                        "tok_time": epoch_time/epoch_tokens,
+                        "tok_time": epoch_time/(epoch_tokens/utils.get_world_size()),
                         "rand_sentences": wandb.Table(columns=["step", "sentence"], data=rand_sentences),
                         "step": curr_iter
                         })#, step=curr_iter)  # TODO: fix this for future projectss

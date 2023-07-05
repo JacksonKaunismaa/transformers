@@ -41,7 +41,7 @@ def main(local_rank, args, data_dir):
                             lr_min=1e-7,
                             block_size=1024,
                             batch_size=2,
-                            grad_accum_steps=256,
+                            grad_accum_steps=128,
                             train_steps=500, # num macro batches
                             num_eval=300,  # num micro batches
                             dtype="float16",
