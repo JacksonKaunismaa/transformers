@@ -10,8 +10,9 @@ class ExperimentCfg:
     n_heads: int = 12
     n_layer: int = 12
     posn_embed_type: str = "base"  # must be in ['base_sinusoid', 'base_learnable', 'relative', 'none', 'rel_bias']
-    rel_posn_bias_max_posn: int = 128  # only has effect if posn_embed_type == "relative"
-    rel_posn_bias_num_buckets: int = 32  # only has effect if posn_embed_type == "relative"
+    rel_bias_max_posn: int = 128  # only has effect if posn_embed_type == "rel_bias"
+    rel_bias_num_buckets: int = 32  # only has effect if posn_embed_type == "rel_bias"
+    relative_float32_attn: bool = False  # if posn_embed_type =="relative", force float32 in relative_posn attention computation
     layer_norm_posn: str = "weird"
     block_size: int = 2048
     flash: bool = True  # whether to use Flash attention or not
@@ -61,7 +62,7 @@ class ExperimentCfg:
         # some defaults that are meant for running a very small network while debugging
         return dataclasses.replace(self, vec_size=128, n_layer=1, n_heads=4, lr_max=2e-4, lr_min=1e-7, block_size=1024, batch_size=2,
                 grad_accum_steps=16, train_steps=2, num_eval=3, dtype="float16", compile=False, zero=False, checkpointing=False,
-                normalizer_type="RMSNorm", rmsnorm_p=0.2, posn_embed_type="relative", flash=False, posn_embed_learnable=False)
+                normalizer_type="RMSNorm", rmsnorm_p=0.2, posn_embed_type="relative", flash=False)
         # return dataclasses.replace(self, 
         #         grad_accum_steps=8, train_steps=2, num_eval=3, dtype="float16", compile=False, zero=False, checkpointing=False,
         #         normalizer_type="RMSNorm", rmsnorm_p=0.2, posn_embed_type="relative", flash=False, posn_embed_learnable=False)

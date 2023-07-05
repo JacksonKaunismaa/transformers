@@ -85,6 +85,9 @@ def run_experiment(dsets, proj_name, ckpt_path, exp_config: config_objects.Exper
         if not load_success:
             print("Attempted to load from checkpoint, but failed, aborting")
             return
+        
+    if utils.get_rank() == 0:
+        print("Config is:", exp_config)
 
     # loss_res = {"eval":[]}
     # utils.barrier()
@@ -97,6 +100,7 @@ def run_experiment(dsets, proj_name, ckpt_path, exp_config: config_objects.Exper
     # for _ in range(180):
     #     time.sleep(1)
     # print("done logging network params usage alon")
+
     train_result = train(net, scaler, sched, optim, exp_config, dsets, log_wandb)
     
     if log_wandb and utils.get_rank() == 0:

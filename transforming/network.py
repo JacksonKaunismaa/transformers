@@ -125,16 +125,12 @@ class CustomNormalizer(nn.Module):
 
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, cfg, main_transformer: "Transformer"):
+    def __init__(self, cfg: config_objects.ExperimentCfg, main_transformer: "Transformer"):
         super().__init__()
         assert cfg.vec_size % cfg.n_heads == 0
 
-        self.vec_size = cfg.vec_size
-        self.n_heads = cfg.n_heads
         self.head_size = cfg.vec_size // cfg.n_heads
-        self.flash = cfg.flash
-        self.attn_dropout_p = cfg.dropout_attn
-        self.posn_embed_type = cfg.posn_embed_type
+        self.cfg = cfg
 
         # need to do this weird call to bypass nn.Module setattr checks
         object.__setattr__(self, "main_transformer", main_transformer)  # save this so we can access the needed buffers
@@ -146,14 +142,14 @@ class MultiHeadAttention(nn.Module):
 
 
         if cfg.posn_embed_type == "relative":  # https://arxiv.org/pdf/1901.02860.pdf
-            self.posn_vect_u = nn.Parameter(torch.zeros(1, self.n_heads, 1, self.head_size))
-            self.posn_vect_v = nn.Parameter(torch.zeros(1, self.n_heads, 1, self.head_size))
-            self.posn_key_mat = nn.Linear(self.vec_size, self.vec_size, bias=False)  # W_k,R in their notation
+            self.posn_vect_u = nn.Parameter(torch.zeros(1, cfg.n_heads, 1, self.head_size))
+            self.posn_vect_v = nn.Parameter(torch.zeros(1, cfg.n_heads, 1, self.head_size))
+            self.posn_key_mat = nn.Linear(cfg.vec_size, cfg.vec_size, bias=False)  # W_k,R in their notation
 
-        self.qkv = nn.Linear(self.vec_size, 3*self.vec_size, bias=False)
-        self.out = nn.Linear(self.vec_size, self.vec_size, bias=False)
+        self.qkv = nn.Linear(cfg.vec_size, 3*cfg.vec_size, bias=False)
+        self.out = nn.Linear(cfg.vec_size, cfg.vec_size, bias=False)
 
-        self.attn_dropout = nn.Dropout(p=self.attn_dropout_p)
+        self.attn_dropout = nn.Dropout(p=cfg.dropout_attn)
         self.out_dropout = nn.Dropout(p=cfg.dropout_out)
 
 
@@ -163,16 +159,16 @@ class MultiHeadAttention(nn.Module):
         batch, seq_len, _ = x.shape
         # print(x.shape)
         # x_head = x.view(batch, seq_len, self.n_heads, self.head_size)
-        qkv = torch.split(self.qkv(x), self.vec_size, dim=-1)  # q,k,v are (batch, seq_len, vec_size)
+        qkv = torch.split(self.qkv(x), self.cfg.vec_size, dim=-1)  # q,k,v are (batch, seq_len, vec_size)
         # transpose so that multiplications are done to each position, not each head
         # q,k,v are now (batch, n_head, seq_len, head_size)
-        q,k,v = [mat.view(batch, seq_len, self.n_heads, self.head_size).transpose(1,2) for mat in qkv]
+        q,k,v = [mat.view(batch, seq_len, self.cfg.n_heads, self.head_size).transpose(1,2) for mat in qkv]
 
-        if self.flash:  # scaled dot product attention
+        if self.cfg.flash:  # scaled dot product attention
             attn = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True,
-                                                  dropout_p=self.attn_dropout_p if self.training else 0)
+                                                  dropout_p=self.cfg.dropout_attn if self.training else 0)
         else:
-            if self.posn_embed_type == "relative":
+            if self.cfg.posn_embed_type == "relative":
                 # can combine terms a) and c) in XL transformer paper since they both are multiplied by k
                 # posn_vect_u (1, n_head, head_size, 1) @ k (batch, n_head, seq_len, head_size) -> (batch, n_head, seq_len, 1)
                 attn_dots = (q + self.posn_vect_u) @ k.transpose(2,3)
@@ -182,23 +178,32 @@ class MultiHeadAttention(nn.Module):
                 rel_posn = self.posn_key_mat(self.main_transformer.relative_posn_embed[-seq_len:]) # type: ignore
                 # reshape into (1, n_head, head_size, seq_len)
                 # unsqueeze(0) <=> add batch dim <=> apply same "relative" position embeds to all samples in batch
-                rel_posn = rel_posn.T.view(self.n_heads, self.head_size, seq_len).unsqueeze(0)
+                rel_posn = rel_posn.T.view(self.cfg.n_heads, self.head_size, seq_len).unsqueeze(0)
                 # force running in float32 here to avoid numerical instability issues
-                with torch.autocast(device_type=utils.get_device_type(), enabled=False): # type: ignore
+                with torch.autocast(device_type=utils.get_device_type(), enabled=not self.cfg.relative_float32_attn): # type: ignore
                     # (batch, n_head, seq_len, head_size) @ (1, n_head, head_size, seq_len) -> (batch, n_head, seq_len, seq_len)
-                    query_posn = (q + self.posn_vect_v) @ rel_posn.float()
-
+                    if self.cfg.relative_float32_attn:
+                        rel_posn = rel_posn.float()
+                    # print("rel_posn.float()", rel_posn.dtype)
+                    # print("q", q.dtype)
+                    # print("posn_vect_v", self.posn_vect_v.dtype)
+                    query_posn = (q + self.posn_vect_v) @ rel_posn
+                    # print("query_posn", query_posn.dtype)
+                    # print("rel_posn", rel_posn.dtype)
                     # if full shape, take advantage of .take speed up
                     if query_posn.shape == self.main_transformer.shift_indices.shape:  # type:ignore
                         shifted_posn = torch.take(query_posn, self.main_transformer.shift_indices)  # type: ignore
                     else:  # about 50% slower
                         row_idx, col_idx = get_variable_index_shifter(seq_len, device=query_posn.device)
                         shifted_posn = query_posn[..., row_idx, col_idx]
+                    # print("shifted_posn", shifted_posn.dtype)
                     # object.__setattr__(self, "shifted_posn", shifted_posn)
                     attn_dots = attn_dots + shifted_posn
+                #     print("attn_dots", attn_dots.dtype)
+                # print("after", attn_dots.dtype)
                     # object.__setattr__(self, "attn_dots", attn_dots)
 
-            elif self.posn_embed_type == "rel_bias":
+            elif self.cfg.posn_embed_type == "rel_bias":
                 rel_bias = self.main_transformer.rel_bias(self.main_transformer.rel_bias_indices[:seq_len, :seq_len]) # type:ignore
                 rel_bias = rel_bias.permute([2, 0, 1]).unsqueeze(0)
                 attn_dots = q @ k.transpose(2, 3) + rel_bias
@@ -215,7 +220,7 @@ class MultiHeadAttention(nn.Module):
             attn = attn_scores @ v
 
         # transpose first so that the reshape operates on the last 2 dimensions only, stacking heads
-        out = self.out(attn.transpose(1,2).reshape(batch, seq_len, self.vec_size))  # (batch, seq_len, vec_size)
+        out = self.out(attn.transpose(1,2).reshape(batch, seq_len, self.cfg.vec_size))  # (batch, seq_len, vec_size)
         return self.out_dropout(out)
 
 
@@ -279,8 +284,12 @@ class Transformer(nn.Module):
         elif self.cfg.posn_embed_type == "rel_bias":
             self.rel_bias = nn.Embedding(self.cfg.block_size, self.cfg.n_heads)
             self.register_buffer("rel_bias_indices", get_rel_bias_indices(self.cfg.block_size,
-                                                                          self.cfg.rel_posn_bias_max_posn,
-                                                                          self.cfg.rel_posn_bias_num_buckets))
+                                                                          self.cfg.rel_bias_max_posn,
+                                                                          self.cfg.rel_bias_num_buckets))
+        elif self.cfg.posn_embed_type == "base_learnable":
+            self.posn_embed = nn.Embedding(self.cfg.block_size, self.cfg.vec_size)
+        elif self.cfg.posn_embed_type == "base_sinusoid":
+            self.register_buffer("posn_embed", sinusoid_matrix(self.cfg.block_size, self.cfg.vec_size))
 
         # lower left triangle (rows = correspond to given location, left/right within a row (cols) = where we are attending to)
         # register_buffer = untrainable parameter, but gets moved onto/off GPU as requested when doing model.to()
@@ -289,11 +298,6 @@ class Transformer(nn.Module):
                              .reshape(1,1, self.cfg.block_size, self.cfg.block_size))
         
         self.embed = nn.Embedding(self.dset_cfg.vocab_size, self.cfg.vec_size)
-
-        if self.cfg.posn_embed_type == "base_learnable":
-            self.posn_embed = nn.Embedding(self.cfg.block_size, self.cfg.vec_size)
-        elif self.cfg.posn_embed_type == "base_sinusoid":
-            self.register_buffer("posn_embed", sinusoid_matrix(self.cfg.block_size, self.cfg.vec_size))
 
         self.blocks = nn.ModuleList([TransformerBlock(self.cfg, self) for _ in range(self.cfg.n_layer)])
 
@@ -458,6 +462,9 @@ class Transformer(nn.Module):
         self.dset_cfg = load_dict["dset_cfg"]  # correctly initialized already
         # self.initialize_architecture()   # bad for setting up checkpointing reasons
 
+        # there should probably just be a thing that just regenerates all buffers based on the new cfg, rather than loading them in
+        if "shift_indices" in load_dict["model"]:  # adjust for batch size
+            load_dict["model"]["shift_indices"] = load_dict["model"]["shift_indices"][:self.cfg.batch_size]
         self.load_state_dict(load_dict["model"])
         self.best_loss = load_dict["best_loss"]
         return True

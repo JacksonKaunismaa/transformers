@@ -41,7 +41,7 @@ def main(local_rank, args, data_dir):
                             lr_min=1e-7,
                             block_size=1024,
                             batch_size=2,
-                            grad_accum_steps=128,
+                            grad_accum_steps=256,
                             train_steps=500, # num macro batches
                             num_eval=300,  # num micro batches
                             dtype="float16",
@@ -52,8 +52,9 @@ def main(local_rank, args, data_dir):
                             rmsnorm_p=0.1,
                             layer_norm_posn="pre",
                             posn_embed_type="relative",
+                            relative_float32_attn=False,
                             flash=False,
-                            learnable_unembed=False,
+                            learnable_unembed=True,
                             job_id=args.id
                             )
     if args.dry:  # if dry run, overwrite config with dry_run config
@@ -73,8 +74,8 @@ def main(local_rank, args, data_dir):
     utils.barrier()
 
     run_experiment(datasets, "transformer-experiments-google-1-billion", 
-                   "checkpoint/large-multi-gpu-zero-relposn-smooth.ckpt" if not args.dry else "checkpoint/dry.ckpt", 
-                   exp_config, log_wandb=True, extend=9898689, resume_id="uax7f0am")
+                   "checkpoint/relative_posn_unembed_learnable.ckpt" if not args.dry else "checkpoint/dry.ckpt", 
+                   exp_config, log_wandb=True, extend=9908562, resume_id="0bh1cllu")
 
 
 if __name__ == "__main__":

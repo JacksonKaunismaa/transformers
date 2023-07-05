@@ -19,7 +19,7 @@ if [[ $SLURM_NNODES -eq 1 ]]; then
     export MASTER_ADDR="127.0.0.1"
     bash run_experiment.sh 1 0
 else                                           # multi-node, {multi,single}-gpu
-    echo "multi, multi, $SLURM_NNODES $(( $SLURM_NNODES - 1 ))"
+    echo "multi, multi, $SLURM_NNODES"
     export MASTER_ADDR="$(hostname --fqdn)"
     for index in $(seq 0 $(( $SLURM_NNODES - 1 ))); do 
         echo "hi $index"
