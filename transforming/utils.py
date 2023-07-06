@@ -5,6 +5,7 @@ import torch
 import numpy as np
 import os
 import socket
+        
 
 def get_time():
     torch.cuda.synchronize()
@@ -54,30 +55,3 @@ def barrier():
 
 def get_raw(net): # slightly awkward way to consistently access underyling Transformer object
     return net.module if isinstance(net, DDP) else net
-
-
-def sample_random_start_word(dset, window_size):   # for generating the samples to show qualitative progress over time
-    while True:  # look over all(-ish) sentence starting words in the dataset, pick one at random
-        idx = np.random.randint(0, len(dset))
-        random_subset = dset[idx][0]  # [0] selects x over y
-        try:  # this can fail if eos token not found, or if eos only found at the very end of the sequence
-            return random_subset[np.where(random_subset == dset.encoder.eos_token)[0][0] + 1].item()  # go 1 token past an eos token
-        except:  # so just wrap it in a try except until it works
-            pass
-    
-
-# sample generate a bunch of sentences using random start words
-def sample_random_sentences(net, dsets, exp_config, num_sample=5, temperature=0.2):
-    start_tokens = [sample_random_start_word(dsets["eval"], 20*exp_config.block_size) for _ in range(num_sample)]
-    stacked_tokens = torch.tensor(start_tokens).unsqueeze(-1).to(net.device)  # (num_samples, 1)
-    # print("found start tokens", start_tokens, dsets["eval"].encoder.decode(start_tokens))
-    return net.generate(dsets["eval"].encoder, stacked_tokens, temperature=temperature) 
-
-
-def traverse_modules(func, mod):
-    has_sub_mods = False
-    for sub_mod in mod.children():
-        traverse_modules(func, sub_mod)
-        has_sub_mods = True
-    if not has_sub_mods: # if no submodules, it is an actual operation
-        func(mod)

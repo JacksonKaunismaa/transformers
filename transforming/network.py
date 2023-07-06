@@ -14,62 +14,7 @@ from contextlib import nullcontext
 from . import config_objects
 from . import utils
 from .utils import rprint
-
-
-def sinusoid_matrix(seq_len, vec_size):  # for position embeddings
-    posn = torch.zeros(seq_len, vec_size)
-    pow_arr = torch.pow(10_000, -torch.arange(0,vec_size,2)/vec_size)
-    seq_arr = torch.arange(seq_len)
-    combined = torch.outer(seq_arr, pow_arr)
-
-    posn[:, ::2] = torch.sin(combined)
-    posn[:, 1::2] = torch.cos(combined)
-    return posn
-
-
-def get_index_shifter(seq_len, batch_size, n_head):  # for relative position embeddings
-    return torch.remainder((torch.arange(seq_len)*-1)[:,None] + torch.arange(seq_len) - 1, seq_len) + \
-        seq_len*torch.arange(seq_len)[:,None] + (torch.arange(n_head)*(seq_len**2))[:,None,None] + \
-        (torch.arange(batch_size)*(n_head*seq_len**2))[:,None,None,None]
-
-
-def get_variable_index_shifter(seq_len, device):
-    col_idx = torch.remainder((torch.arange(seq_len, device=device)*-1)[:,None] + torch.arange(seq_len, device=device) - 1, seq_len)
-    row_idx = torch.arange(seq_len, device=device)[:,None]
-    return row_idx, col_idx
-
-def get_rel_bias_indices(block_size, max_distance, num_buckets):
-    # adapted from https://github.com/huggingface/transformers/blob/v4.30.0/src/transformers/models/t5/modeling_t5.py#L388
-    context_position = torch.arange(block_size, dtype=torch.long)[:, None]
-    memory_position = torch.arange(block_size, dtype=torch.long )[None, :]
-    relative_position = memory_position - context_position
-
-    # elementwise minimum, basically zeroes out upper right triangle
-    relative_position = -torch.min(relative_position, torch.zeros_like(relative_position)) 
-    # now relative_position is in the range [0, inf)
-
-    # half of the buckets are for single increment
-    max_exact = num_buckets // 2
-    is_small = relative_position < max_exact
-
-    # The other half of the buckets are for logarithmically bigger bins in positions up to max_distance
-    # seq_len - max_exact is the num of positions we have for the log-bins
-    # but we only want to go up to position max_distance
-    relative_position_if_large = max_exact + (
-        torch.log(relative_position.float() / max_exact)   # ie. log(rel_posn) - log(max_exact)
-        / np.log(max_distance / max_exact)  # ie. log(max_distance) - log(max_exact) => at posn max_distance the log -> 1
-        * (num_buckets - max_exact)   # so that now at max_distance the log is num_buckets - max_exact
-    ).long()
-
-    # ie. basically set stuff past max_position to num_buckets-1
-    # set anything that went past num_buckets to num_buckets-1
-     # we are definietly "large" out here, so it makes sense
-    relative_position_if_large = torch.min(      
-        relative_position_if_large, torch.full_like(relative_position_if_large, num_buckets - 1) 
-    )
-                                                                               
-    return torch.where(is_small, relative_position, relative_position_if_large)
-
+from . import net_utils
 
 
 class MLPBlock(nn.Module):
@@ -194,7 +139,7 @@ class MultiHeadAttention(nn.Module):
                     if query_posn.shape == self.main_transformer.shift_indices.shape:  # type:ignore
                         shifted_posn = torch.take(query_posn, self.main_transformer.shift_indices)  # type: ignore
                     else:  # about 50% slower
-                        row_idx, col_idx = get_variable_index_shifter(seq_len, device=query_posn.device)
+                        row_idx, col_idx = net_utils.get_variable_index_shifter(seq_len, device=query_posn.device)
                         shifted_posn = query_posn[..., row_idx, col_idx]
                     # print("shifted_posn", shifted_posn.dtype)
                     # object.__setattr__(self, "shifted_posn", shifted_posn)
@@ -257,11 +202,10 @@ class TransformerBlock(nn.Module):
         return x
 
 class Transformer(nn.Module):
-    def __init__(self, path, model_cfg: config_objects.ExperimentCfg, dset_cfg: config_objects.DatasetCfg):
+    def __init__(self, model_cfg: config_objects.ExperimentCfg, dset_cfg: config_objects.DatasetCfg):
         super().__init__()
 
         # for saving stuff purposes
-        self.path = path
         self.cfg = model_cfg
         self.dset_cfg = dset_cfg
         self.best_loss = float('inf')
@@ -274,22 +218,24 @@ class Transformer(nn.Module):
 
         if self.cfg.posn_embed_type == "relative":  # register these only once to save memory
             # .flip to match decreasing order of pos embeddings, per XL transformer paper (see appendix B, defn of Q matrix)
-            self.register_buffer("relative_posn_embed", sinusoid_matrix(self.cfg.block_size, self.cfg.vec_size).flip(0).contiguous())
+            self.register_buffer("relative_posn_embed", 
+                                 net_utils.sinusoid_matrix(self.cfg.block_size, self.cfg.vec_size).flip(0).contiguous())
             
             # for full sized inputs, pre-computing everything and doing a .take is fastest, so we have shift_indices
             # for different sized inputs, .take wouldn't work since it requires linear indices, so we use the method
             # of shift_col_indices and shift_row_indices, which is still faster than the original XL transformer
             # implementation, but allows indexing for variable length inputs
-            self.register_buffer("shift_indices", get_index_shifter(self.cfg.block_size, self.cfg.batch_size, self.cfg.n_heads))
+            self.register_buffer("shift_indices", 
+                                 net_utils.get_index_shifter(self.cfg.block_size, self.cfg.batch_size, self.cfg.n_heads))
         elif self.cfg.posn_embed_type == "rel_bias":
             self.rel_bias = nn.Embedding(self.cfg.block_size, self.cfg.n_heads)
-            self.register_buffer("rel_bias_indices", get_rel_bias_indices(self.cfg.block_size,
-                                                                          self.cfg.rel_bias_max_posn,
-                                                                          self.cfg.rel_bias_num_buckets))
+            self.register_buffer("rel_bias_indices", net_utils.get_rel_bias_indices(self.cfg.block_size,
+                                                                                    self.cfg.rel_bias_max_posn,
+                                                                                    self.cfg.rel_bias_num_buckets))
         elif self.cfg.posn_embed_type == "base_learnable":
             self.posn_embed = nn.Embedding(self.cfg.block_size, self.cfg.vec_size)
         elif self.cfg.posn_embed_type == "base_sinusoid":
-            self.register_buffer("posn_embed", sinusoid_matrix(self.cfg.block_size, self.cfg.vec_size))
+            self.register_buffer("posn_embed", net_utils.sinusoid_matrix(self.cfg.block_size, self.cfg.vec_size))
 
         # lower left triangle (rows = correspond to given location, left/right within a row (cols) = where we are attending to)
         # register_buffer = untrainable parameter, but gets moved onto/off GPU as requested when doing model.to()
@@ -406,69 +352,6 @@ class Transformer(nn.Module):
             tokens = tokens[retain]
         return [encoder.decode(sent.detach().cpu().numpy()) for sent in finished_sentences]
 
-    def save_model_state_dict(self, optim=None, path=None, **kwargs):  # kwargs should contain optimizer,scheduler, and scaler
-        if path is None:
-            path = self.path
-
-        save_dict = {"model": self.state_dict(),
-                     "cfg": self.cfg,
-                     "dset_cfg": self.dset_cfg,
-                     "best_loss": self.best_loss}
-
-        if self.cfg.ddp and self.cfg.zero and optim is not None:  # sharded optimizer => need to collate before saving
-            rprint("is consolidating")
-            # rprint("Has state", optim.state.keys())
-            rprint("pre consolidate, has num_params", len(optim.param_groups[0]["params"]))
-            optim.consolidate_state_dict()
-            rprint("post consolidate, rank, has num_params", len(optim.param_groups[0]["params"]))
-
-            if utils.get_rank() == 0:
-                # rprint("is saving", optim.state_dict().keys())
-                rprint("saving num_params", len(optim.state_dict()["param_groups"][0]["params"]))
-                rprint("state_dict device is", optim.state_dict()["state"][0]["exp_avg"].device)
-                save_dict["optim"] = optim.state_dict()  # it transfers shards to CPU first, so GPU mem is fine
-            rprint("done consolidating")
-        elif optim is not None:
-            save_dict["optim"] = optim.state_dict()
-
-        for k,obj in kwargs.items():  # add scheduler, scaler state dicts
-            save_dict[k] = obj.state_dict()
-
-        if utils.get_rank() == 0:
-            rprint("saving being done")
-            torch.save(save_dict, path)  # only do teh actual io if rank 0
-
-    def load_model_state_dict(self, map_location, path=None, **kwargs) -> bool:
-        # kwargs should contain optimizer,scheduler, and scaler
-        if path is None:
-            path = self.path
-
-        if not osp.exists(path):
-            print("No existing model found", path)
-            return False
-        print("Found path of", path)
-        load_dict = torch.load(path, map_location=map_location)  # load everything onto cpu so that for sharded models, it doesn't fail
-        rprint(load_dict["model"].keys())
-        rprint("keys", load_dict.keys())
-        rprint("is loading to", map_location)
-        # rprint("has num_params", len(kwargs["optim"].param_groups[0]["params"]))
-        for k,obj in kwargs.items():  # load optimizer, scheduler, scaler state dicts
-            if k == "optim":
-                rprint(len(obj.param_groups[0]["params"]), type(obj.param_groups[0]["params"][0]), len(load_dict[k]["param_groups"][0]["params"]))
-            obj.load_state_dict(load_dict[k])
-
-        # make sure all layer sizes, blocks are correctly initialized before loading model state dict
-        self.cfg = load_dict["cfg"]  # this shouldn't be necessary since loading optim beforehand requires that it be
-        self.dset_cfg = load_dict["dset_cfg"]  # correctly initialized already
-        # self.initialize_architecture()   # bad for setting up checkpointing reasons
-
-        # there should probably just be a thing that just regenerates all buffers based on the new cfg, rather than loading them in
-        if "shift_indices" in load_dict["model"]:  # adjust for batch size
-            load_dict["model"]["shift_indices"] = load_dict["model"]["shift_indices"][:self.cfg.batch_size]
-        self.load_state_dict(load_dict["model"])
-        self.best_loss = load_dict["best_loss"]
-        return True
-
 
     def get_optim(self): # optim, sched, scaler, autocast context
         # set initial LR to 1 so that the LinearLR/warmup stage works better
@@ -506,7 +389,7 @@ class Transformer(nn.Module):
                     return ckpt.checkpoint(orig_forward, *inputs, preserve_rng_state=False, use_reentrant=False)
                 module.forward = checkpoint_fwd  # type: ignore
 
-        utils.traverse_modules(add_checkpointing, self)
+        net_utils.traverse_modules(add_checkpointing, self)
         # to get model vram, you need to do looped waiting
         # for speed-wise on small, estimates were smoothed with gamma=0.999, sampled at the last step where all are available
         # for small sizes (batch=1, seq_len=10, heads=1, layers=10, vec_size=1280)

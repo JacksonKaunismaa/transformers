@@ -17,27 +17,26 @@ from . import network
 from . import data
 from . import utils
 from . import metrics
+from . import net_utils
 from .utils import rprint
 
-def run_experiment(dsets, proj_name, ckpt_path, exp_config: config_objects.ExperimentCfg, 
-                   extend=0, log_wandb=False, resume_id=""):
+def run_experiment(dsets, proj_name, resume_path, exp_config: config_objects.ExperimentCfg, log_wandb=True, resume=True):
+    net = network.Transformer(exp_config, dsets["train"].cfg)
+    resumer = net_utils.Resumer(resume_path, net, resume=resume)  # updates exp_config and net.cfg if resume file found
+    
     if log_wandb and utils.get_rank() == 0:
-        wandb.init(project=proj_name, id=resume_id if resume_id else None, resume="must" if resume_id else None,
-                   config={**dataclasses.asdict(exp_config),
-                           **dataclasses.asdict(dsets["train"].cfg)})
+        run_obj = wandb.init(project=proj_name,   # resume=True => we search for a a resume file and open it
+                             id=resumer.wandb_run_id if resume else None,   # wandb_run_id is None if resume=False
+                             resume="must" if resume and resumer.wandb_run_id else None,  # wandb_run_id is not None iff resume=True
+                             config={**dataclasses.asdict(exp_config),          # and an existing resume file was found
+                                     **dataclasses.asdict(dsets["train"].cfg)})
+        # if wandb_run_id wasn't set before (either resume=False or no resume file found), set it now for sure
+        resumer.wandb_run_id = run_obj.id  # type: ignore 
 
-    #if exp_config.ddp:
-        # [print(utils.get_local_rank(), torch.cuda.get_device_properties(n)) for n in range(torch.cuda.device_count())]
-    ckpt_path = osp.realpath(ckpt_path)
-    print("model save path is ", ckpt_path)
-    net = network.Transformer(ckpt_path, exp_config, dsets["train"].cfg) # type: ignore
-
+    print("model save path is ", resumer.model_save_path)
     assert (exp_config.grad_accum_steps % utils.get_world_size() == 0)
     exp_config.grad_accum_steps //= utils.get_world_size() # can write to config since wandb config is already set?       
     device_id = utils.get_local_rank() # % utils.get_world_size()  # modulus to ensure contiguous?
-    # sort of hacky, so we only set the train dset_cfg, so we just need to ensure that we only use "train's" dset_cfg
-    # from within the train function
-    #exp_config.device = f"{exp_config.device}:{device_id}"
     rprint("running with accum_step", exp_config.grad_accum_steps)
     device = f"{utils.get_device_type()}:{device_id}"
     # #rprint("setting device to", exp_config.device, net.cfg.device)
@@ -57,7 +56,6 @@ def run_experiment(dsets, proj_name, ckpt_path, exp_config: config_objects.Exper
             os.environ["MASTER_ADDR"], os.environ["MASTER_PORT"], "bad")
         net = DDP(net, device_ids=[device_id], output_device=device_id)
         # [print(utils.get_local_rank(), torch.cuda.memory_allocated(n)) for n in range(torch.cuda.device_count())]
-    
 
     # with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
     #     with record_function("model"):
@@ -71,20 +69,17 @@ def run_experiment(dsets, proj_name, ckpt_path, exp_config: config_objects.Exper
     # return
 
     # #rprint("setting device to", exp_config.device, net.cfg.device)
-
     scaler, sched, optim = utils.get_raw(net).get_optim()
-    # #rprint("setting device to", exp_config.device, net.cfg.device)
 
-    if extend:  # set extend to the slurm job id of the run that generated it so we can acces the checkpoint
+    if resume:
         map_location = device  # make sure we load to the right device
-        actual_ckpt_dir = osp.dirname(ckpt_path)
-        old_ckpt_dir = osp.join(osp.dirname(actual_ckpt_dir), str(extend))  # go into the different job id's checkpoint dir
-        old_ckpt_path = osp.join(old_ckpt_dir, osp.basename(ckpt_path))
-        load_success = utils.get_raw(net).load_model_state_dict(map_location, path=old_ckpt_path, 
-                                                                scaler=scaler, sched=sched, optim=optim)
+        load_success = resumer.load(map_location, update_model_save_path=True,
+                                    scaler=scaler, sched=sched, optim=optim)
         if not load_success:
             print("Attempted to load from checkpoint, but failed, aborting")
             return
+    # #rprint("setting device to", exp_config.device, net.cfg.device)
+
         
     if utils.get_rank() == 0:
         print("Config is:", exp_config)
@@ -101,7 +96,7 @@ def run_experiment(dsets, proj_name, ckpt_path, exp_config: config_objects.Exper
     #     time.sleep(1)
     # print("done logging network params usage alon")
 
-    train_result = train(net, scaler, sched, optim, exp_config, dsets, log_wandb)
+    train_result = train(net, resumer, scaler, sched, optim, exp_config, dsets, log_wandb)
     
     if log_wandb and utils.get_rank() == 0:
         wandb.finish()
@@ -176,7 +171,7 @@ def run_experiment(dsets, proj_name, ckpt_path, exp_config: config_objects.Exper
 
 
 
-def train(net, scaler, scheduler, optimizer, exp_config: config_objects.ExperimentCfg, dsets, log_wandb):
+def train(net, resumer, scaler, scheduler, optimizer, exp_config: config_objects.ExperimentCfg, dsets, log_wandb):
     # TODO: consider changing this weird iterated dictionary thing into something clearer
     # maybe another class or only track the current epoch and do it with a {"loss", "perp", "accu"}
     # then you don't have to compute "shortened" names, the code is simpler. Another option is to 
@@ -226,9 +221,7 @@ def train(net, scaler, scheduler, optimizer, exp_config: config_objects.Experime
         epoch_summary = f'Iter {curr_iter}: ' + " ".join(f"{name}: {val:.4f}" for name,val in short_name_metrics.items())
         if utils.get_rank() == 0:  # only 1 process needs to do this
             if log_wandb:
-                # all_sentences.extend([[curr_iter, sent] for sent in utils.sample_random_sentences(net, dsets, exp_config)])
-                # print(wandb.run.logged_artifacts())
-                rand_sentences = [[curr_iter, sent] for sent in utils.sample_random_sentences(non_ddp_net, dsets, exp_config)]
+                rand_sentences = [[curr_iter, sent] for sent in net_utils.sample_random_sentences(non_ddp_net, dsets)]
                 wandb.log({**short_name_metrics,
                         "lr": optimizer.param_groups[0]["lr"],
                         "tok_time": epoch_time/(epoch_tokens/utils.get_world_size()),
@@ -241,7 +234,8 @@ def train(net, scaler, scheduler, optimizer, exp_config: config_objects.Experime
             non_ddp_net.best_loss = all_metrics["loss"]["eval"][-1]
             # if utils.get_rank() == 0:  # put rank check here so that all ranks have consistent .best_loss
             # need to disable the rank check here since sharded optimizer requires all ranks to consolidate
-            non_ddp_net.save_model_state_dict(scaler=scaler, optim=optimizer, sched=scheduler)
+            resumer.save(scaler=scaler, optim=optimizer, sched=scheduler)
+            # non_ddp_net.save_model_state_dict(scaler=scaler, optim=optimizer, sched=scheduler)
             # ie. save the nan model, but stop training
             if all_metrics["loss"]["eval"][-1].isnan().any():  # type: ignore
                 print("detected nan failure, aborting training...")

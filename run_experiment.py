@@ -17,7 +17,7 @@ from transforming import utils
 torch.backends.cuda.matmul.allow_tf32 = True # type: ignore
 torch.backends.cudnn.allow_tf32 = True # type: ignore
 #torch._functorch.config.functionalize_rng_ops=True # type: ignore
-torch._dynamo.config.verbose = True # type: ignore
+# torch._dynamo.config.verbose = True # type: ignore
 # torch._dynamo.config.log_level = logging.INFO # type: ignore
 
 
@@ -51,7 +51,7 @@ def main(local_rank, args, data_dir):
                             normalizer_type="RMSNorm",
                             rmsnorm_p=0.1,
                             layer_norm_posn="pre",
-                            posn_embed_type="relative",
+                            posn_embed_type="rel_bias",
                             relative_float32_attn=False,
                             flash=False,
                             learnable_unembed=True,
@@ -70,12 +70,10 @@ def main(local_rank, args, data_dir):
     datasets = dict(train=IdxDataset("train.bin", exp_config, dset_config),
                     eval=IdxDataset("eval.bin", exp_config, dset_config))
     
-
     utils.barrier()
 
-    run_experiment(datasets, "transformer-experiments-google-1-billion", 
-                   "checkpoint/relative_posn_unembed_learnable.ckpt" if not args.dry else "checkpoint/dry.ckpt", 
-                   exp_config, log_wandb=True, extend=9908562, resume_id="0bh1cllu")
+    run_experiment(datasets, "transformer-experiments-google-1-billion", args.resume_path if not args.dry else "dry.ckpt", 
+                   exp_config, log_wandb=True, resume=True)
 
 
 if __name__ == "__main__":
@@ -89,8 +87,10 @@ if __name__ == "__main__":
     parser.add_argument('--nnodes', default=1, type=int, help="number of compute-nodes (local_world_size * nnodes = world_size)")
     parser.add_argument('--dry', action="store_true", help="set this flag to run with a very small network, for debugging purposes")
     parser.add_argument('--id', default=0, type=int, help="Slurm job id (for true location of checkpoint)")
+    parser.add_argument('--resume-path', help="Path of resume file where model cfg, save path, and wandb_run_id will be stored")
     args = parser.parse_args()
     print(args)
+    print("cuda state", torch.cuda.is_available(), torch.cuda.device_count())
     if args.nnodes > 1 or args.local_world_size > 1:
         if "MASTER_ADDR" not in os.environ:
             os.environ["MASTER_ADDR"] = "127.0.0.1"
