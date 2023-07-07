@@ -58,6 +58,10 @@ class ExperimentCfg:
     def __hash__(self):
         return hash(str(self))
     
+    def replace_in_place(self, **changes):
+        for k, v in changes.items():
+            setattr(self, k, v)
+    
     def get_dry(self):
         # some defaults that are meant for running a very small network while debugging
         return dataclasses.replace(self, vec_size=128, n_layer=1, n_heads=4, lr_max=2e-4, lr_min=1e-7, block_size=1024, batch_size=2,

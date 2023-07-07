@@ -202,7 +202,7 @@ class TransformerBlock(nn.Module):
         return x
 
 class Transformer(nn.Module):
-    def __init__(self, model_cfg: config_objects.ExperimentCfg, dset_cfg: config_objects.DatasetCfg):
+    def __init__(self, model_cfg: config_objects.ExperimentCfg, dset_cfg: config_objects.DatasetCfg, no_init=False):
         super().__init__()
 
         # for saving stuff purposes
@@ -210,7 +210,8 @@ class Transformer(nn.Module):
         self.dset_cfg = dset_cfg
         self.best_loss = float('inf')
         self.checkpointing_setup = False  # flag to make sure we only ever set up checkpointing once
-        self.initialize_architecture()  # uses saved cfg to make the layers
+        if not no_init:
+            self.initialize_architecture()  # uses saved cfg to make the layers
 
     def initialize_architecture(self):
         assert self.cfg.posn_embed_type in ["base_sinusoid", "base_learnable", "relative", "none", "rel_bias"]
@@ -264,7 +265,11 @@ class Transformer(nn.Module):
         print(f"Approximate expected train vram usage: {self.expected_vram_size():.2f} GB")
 
     def num_params(self): # returns num parameters in millions
-        return sum(p.numel() for p in self.parameters() if p.requires_grad) / 1_000_000
+        return sum(p.numel() for p in self.parameters() if p.requires_grad) / 1_000_000  
+    
+    @property  # so that it works through a .to
+    def device(self):
+        return self.embed.weight.device
 
     def expected_vram_size(self):  # returns size in approximate GiB during training
         # https://arxiv.org/pdf/2205.05198.pdf
@@ -413,8 +418,4 @@ class Transformer(nn.Module):
                 # traverse <=> GeLU+Normalizer (2.008e-4 vs 1.993e-4)
                 # full blocks is significantly slower ~25% (2.60e-4 vs 1.96e-4)
                 # traverse very close to no checkpointing (2.008e-4 vs 1.960e-4)
-
-    @property  # so that it works through a .to
-    def device(self):
-        return self.embed.weight.device
 

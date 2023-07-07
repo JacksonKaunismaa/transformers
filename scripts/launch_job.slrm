@@ -17,7 +17,7 @@ export MASTER_PORT="$(python -c 'import socket; s=socket.socket(); s.bind(("", 0
 
 if [[ $SLURM_NNODES -eq 1 ]]; then
     export MASTER_ADDR="127.0.0.1"
-    bash run_experiment.sh 1 0
+    bash run_experiment.sh 1 0 $1
 else                                           # multi-node, {multi,single}-gpu
     echo "multi, multi, $SLURM_NNODES"
     export MASTER_ADDR="$(hostname --fqdn)"
@@ -25,7 +25,7 @@ else                                           # multi-node, {multi,single}-gpu
         echo "hi $index"
         /opt/slurm/bin/srun -lN$index --mem-per-cpu=$SLURM_MEM_PER_CPU --gres=gpu:$SLURM_GPUS_PER_NODE -c $SLURM_CPUS_ON_NODE \
             -N 1 -n 1 -r $index --output=logs/slurm.%j-worker-$index.out --error=logs/slurm.%j-worker-$index.err \
-            bash run_experiment.sh $SLURM_NNODES $index &
+            bash run_experiment.sh $SLURM_NNODES $index $1 &
     done
 
     wait

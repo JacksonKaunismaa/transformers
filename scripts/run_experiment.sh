@@ -53,5 +53,5 @@ python3 -m wandb login $(cat wandb_api_key)
 # fi
 # would have used torchrun for this, but it just didn't work for some reason (couldn't get NCCL to not complain about
 # duplicate GPU use)
-python3 run_experiment.py --local-world-size=$SLURM_GPUS_PER_NODE --nnodes=$1 --rank=$2 --num-workers=$SLURM_CPUS_PER_GPU --id=$SLURM_JOB_ID
+python3 run_experiment.py --local-world-size=$SLURM_GPUS_PER_NODE --nnodes=$1 --rank=$2 --num-workers=$SLURM_CPUS_PER_GPU --id=$SLURM_JOB_ID --resume-path=$3
 

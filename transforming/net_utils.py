@@ -10,7 +10,7 @@ from . import utils
 from .utils import rprint
 
 class Resumer():
-    def __init__(self, resume_path, net, resume=True, model_ckpt_dir="/checkpoint"):
+    def __init__(self, resume_path, net, resume=True, model_ckpt_dir="/checkpoint/jackk"):
         self.resume_path = resume_path
         self.model_ckpt_dir = model_ckpt_dir
 
@@ -26,12 +26,12 @@ class Resumer():
                 existing_paths = glob.glob(osp.join(resume_path, "*"))
                 nums = [int(path.split(".")[-1]) for path in existing_paths] + [0]  # add [0] so there is always at least 1 element
                 next_num = max(nums) + 1
-                self.resume_path = osp.join(resume_path, f".{next_num}")
+                self.resume_path = f"{resume_path}.{next_num}"
                 print("Warning: Creating new resume file since you specified an already existing resume path, but resume=False")
                 print("New path is: ", self.resume_path)
 
         self.name = osp.basename(self.resume_path)
-        if not hasattr(self, "model_save_path"):  # only way in which its set is if resume=True and resume_path exists
+        if self.model_save_path is None:  # only way in which its set is if resume=True and resume_path exists
             self.update_model_save_path()    # otherwise, set it to /checkpoint/curr_job_id/name
 
         print("Model name is", self.name, "will be saving to", self.model_save_path)
@@ -46,8 +46,8 @@ class Resumer():
                 resume_info = dict(wandb_run_id=self.wandb_run_id,
                                    cfg=dataclasses.asdict(self.net.cfg),
                                    model_save_path=self.model_save_path)
-                json.dump(resume_info, f)
-
+                json.dump(resume_info, f, indent=True)
+        
         # save state_dicts
         save_dict = {"model": self.net.state_dict(),
                      "cfg": self.net.cfg,
@@ -82,7 +82,7 @@ class Resumer():
             resume_info = json.load(f)
         self.wandb_run_id = resume_info["wandb_run_id"]
         self.model_save_path = resume_info["model_save_path"]
-        dataclasses.replace(self.net.cfg, **resume_info["cfg"])
+        self.net.cfg.replace_in_place(**resume_info["cfg"])
 
         if map_location is None:  # if map_location is not specified, don't actually load anything
             print("map_location not specified, skipping loading state_dicts")
@@ -100,7 +100,9 @@ class Resumer():
         # rprint("has num_params", len(kwargs["optim"].param_groups[0]["params"]))
         for k,obj in kwargs.items():  # load optimizer, scheduler, scaler state dicts
             if k == "optim":
+                # rprint([(i, t.shape) if hasattr(t, "shape") else (i, t, type(t)) for i, t in enumerate(obj.param_groups[0]["params"])])
                 rprint(len(obj.param_groups[0]["params"]), type(obj.param_groups[0]["params"][0]), len(load_dict[k]["param_groups"][0]["params"]))
+                # rprint([(i, t["exp_avg"].shape) for i, t in enumerate(load_dict[k]["state"].values())])
             obj.load_state_dict(load_dict[k])
 
         # make sure all layer sizes, blocks are correctly initialized before loading model state dict
