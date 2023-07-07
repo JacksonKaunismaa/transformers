@@ -51,9 +51,9 @@ def main(local_rank, args, data_dir):
                             normalizer_type="RMSNorm",
                             rmsnorm_p=0.1,
                             layer_norm_posn="pre",
-                            posn_embed_type="rel_bias",
+                            posn_embed_type="rotary",
                             relative_float32_attn=False,
-                            flash=False,
+                            flash=True,
                             learnable_unembed=True,
                             job_id=args.id
                             )

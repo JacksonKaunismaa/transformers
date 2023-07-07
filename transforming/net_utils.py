@@ -78,6 +78,9 @@ class Resumer():
             torch.save(save_dict, self.model_save_path)  # type: ignore 
 
     def load(self, map_location=None, update_model_save_path=False, **kwargs) -> bool:  # returns True if loading succeeds
+        if not osp.exists(self.resume_path):  # if resume_path doesn't even exist, assume this is a fresh run
+            print("No resume file found, assuming fresh model run")
+            return True
         with open(self.resume_path, "r") as f:
             resume_info = json.load(f)
         self.wandb_run_id = resume_info["wandb_run_id"]
@@ -135,6 +138,8 @@ def sinusoid_matrix(seq_len, vec_size):  # for position embeddings
     return posn
 
 
+
+# RELATIVE
 def get_index_shifter(seq_len, batch_size, n_head):  # for relative position embeddings
     return torch.remainder((torch.arange(seq_len)*-1)[:,None] + torch.arange(seq_len) - 1, seq_len) + \
         seq_len*torch.arange(seq_len)[:,None] + (torch.arange(n_head)*(seq_len**2))[:,None,None] + \
@@ -147,6 +152,8 @@ def get_variable_index_shifter(seq_len, device):  # could use a cache here to sa
     return row_idx, col_idx
 
 
+
+# REL_BIAS
 def get_rel_bias_indices(block_size, max_distance, num_buckets):
     # adapted from https://github.com/huggingface/transformers/blob/v4.30.0/src/transformers/models/t5/modeling_t5.py#L388
     context_position = torch.arange(block_size, dtype=torch.long)[:, None]
@@ -180,22 +187,35 @@ def get_rel_bias_indices(block_size, max_distance, num_buckets):
     return torch.where(is_small, relative_position, relative_position_if_large)
 
 
+
+# ROTARY
+# from https://github.com/lucidrains/rotary-embedding-torch/blob/main/rotary_embedding_torch/rotary_embedding_torch.py
+def get_rotary_freqs(block_size, theta, rotary_dim):
+    freqs = 1. / (theta ** (torch.arange(0, rotary_dim, 2)[:(rotary_dim // 2)].float() / rotary_dim))
+    seq = torch.arange(block_size)
+    m_freq = torch.outer(seq, freqs)
+    return m_freq
+
 # from https://github.com/lucidrains/rotary-embedding-torch/blob/main/rotary_embedding_torch/rotary_embedding_torch.py#L33
 def rotate_half(x):
     x1, x2 = rearrange(x, '... (d r) -> r ... d', r = 2)
     return rearrange([-x2, x1], 'r ... d -> ... (d r)')  # einops symmetry!
 
 
+def rotate_q_or_k(q_or_k, freqs, rot_dim):
+    t, t_right = q_or_k[..., :rot_dim], q_or_k[..., rot_dim:]  # will be neglibile anyway (unless they are ~0)
+    t = (t * freqs.cos()) + (rotate_half(t) * freqs.sin())  # elementwise product of cos(m*theta_i), rotate each 2-subspace
+    return torch.cat([t, t_right], dim=-1)   # concatenate rotated part (t) and unrotated part (t_right)
+
 # from https://github.com/lucidrains/rotary-embedding-torch/blob/main/rotary_embedding_torch/rotary_embedding_torch.py#L109
-def rotate_keys_or_queries(q_or_k, cos_freqs, sin_freqs):
-    rot_dim = cos_freqs.shape[-1]  # only use the first rot_dim units of embedding dimension, since effect on units past this
-    # t, t_right = q_or_k[..., :rot_dim], q_or_k[..., rot_dim:]  # will be neglibile anyway (unless they are ~0)
-    q_or_k[..., :rot_dim] = (q_or_k[..., rot_dim] * cos_freqs) + (rotate_half(q_or_k[..., rot_dim]) * sin_freqs)  # elementwise product of cos(m*theta_i), rotate each 2-subspace
-    #return torch.cat([t, t_right], dim=-1)   # concatenate rotated part (t) and unrotated part (t_right)
-    return q_or_k
+def rotate_q_and_k(q, k, freqs):
+    rot_dim = freqs.shape[-1]  # only use the first rot_dim units of embedding dimension, since effect on units past this
+    freqs = freqs[:q.shape[2]]  # select up to seq_len
+    return rotate_q_or_k(q, freqs, rot_dim), rotate_q_or_k(k, freqs, rot_dim)
+    
 
 
-
+# GENERATING RANDOM SENTENCES
 def sample_random_start_word(dset):   # for generating the samples to show qualitative progress over time
     while True:  # look over all(-ish) sentence starting words in the dataset, pick one at random
         idx = np.random.randint(0, len(dset))
@@ -205,7 +225,6 @@ def sample_random_start_word(dset):   # for generating the samples to show quali
         except:  # so just wrap it in a try except until it works
             pass
     
-
 # sample generate a bunch of sentences using random start words
 def sample_random_sentences(net, dsets, num_sample=5, temperature=0.2):
     start_tokens = [sample_random_start_word(dsets["eval"]) for _ in range(num_sample)]
@@ -214,6 +233,8 @@ def sample_random_sentences(net, dsets, num_sample=5, temperature=0.2):
     return net.generate(dsets["eval"].encoder, stacked_tokens, temperature=temperature) 
 
 
+
+# ACTIVATION CHECKPOINTING (and potentially saving activations)
 def traverse_modules(func, mod):
     has_sub_mods = False
     for sub_mod in mod.children():

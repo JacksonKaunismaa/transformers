@@ -81,9 +81,9 @@ class MultiHeadAttention(nn.Module):
         object.__setattr__(self, "main_transformer", main_transformer)  # save this so we can access the needed buffers
 
 
-        if cfg.flash and cfg.posn_embed_type not in ["base_sinusoid", "base_learnable", "none"]:
+        if cfg.flash and cfg.posn_embed_type not in ["base_sinusoid", "base_learnable", "none", "rotary"]:
             raise ValueError(f"Flash attention is currently incompatible with posn_embed type '{cfg.posn_embed_type}'."
-                             f" Flash attention only supports posn_embed_type in ['base_sinusoid', 'base_learnable', 'none']")
+                             f" Flash attention only supports posn_embed_type in ['base_sinusoid', 'base_learnable', 'none', 'rotary']")
 
 
         if cfg.posn_embed_type == "relative":  # https://arxiv.org/pdf/1901.02860.pdf
@@ -109,6 +109,9 @@ class MultiHeadAttention(nn.Module):
         # q,k,v are now (batch, n_head, seq_len, head_size)
         q,k,v = [mat.view(batch, seq_len, self.cfg.n_heads, self.head_size).transpose(1,2) for mat in qkv]
 
+        if self.cfg.posn_embed_type == "rotary":
+            q, k = net_utils.rotate_q_and_k(q, k, self.main_transformer.rotary_freqs) # type: ignore
+
         if self.cfg.flash:  # scaled dot product attention
             attn = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True,
                                                   dropout_p=self.cfg.dropout_attn if self.training else 0)
@@ -126,27 +129,19 @@ class MultiHeadAttention(nn.Module):
                 rel_posn = rel_posn.T.view(self.cfg.n_heads, self.head_size, seq_len).unsqueeze(0)
                 # force running in float32 here to avoid numerical instability issues
                 with torch.autocast(device_type=utils.get_device_type(), enabled=not self.cfg.relative_float32_attn): # type: ignore
-                    # (batch, n_head, seq_len, head_size) @ (1, n_head, head_size, seq_len) -> (batch, n_head, seq_len, seq_len)
                     if self.cfg.relative_float32_attn:
                         rel_posn = rel_posn.float()
-                    # print("rel_posn.float()", rel_posn.dtype)
-                    # print("q", q.dtype)
-                    # print("posn_vect_v", self.posn_vect_v.dtype)
+
+                    # (batch, n_head, seq_len, head_size) @ (1, n_head, head_size, seq_len) -> (batch, n_head, seq_len, seq_len)
                     query_posn = (q + self.posn_vect_v) @ rel_posn
-                    # print("query_posn", query_posn.dtype)
-                    # print("rel_posn", rel_posn.dtype)
                     # if full shape, take advantage of .take speed up
                     if query_posn.shape == self.main_transformer.shift_indices.shape:  # type:ignore
                         shifted_posn = torch.take(query_posn, self.main_transformer.shift_indices)  # type: ignore
                     else:  # about 50% slower
                         row_idx, col_idx = net_utils.get_variable_index_shifter(seq_len, device=query_posn.device)
                         shifted_posn = query_posn[..., row_idx, col_idx]
-                    # print("shifted_posn", shifted_posn.dtype)
-                    # object.__setattr__(self, "shifted_posn", shifted_posn)
-                    attn_dots = attn_dots + shifted_posn
-                #     print("attn_dots", attn_dots.dtype)
-                # print("after", attn_dots.dtype)
-                    # object.__setattr__(self, "attn_dots", attn_dots)
+
+                    attn_dots += shifted_posn
 
             elif self.cfg.posn_embed_type == "rel_bias":
                 rel_bias = self.main_transformer.rel_bias(self.main_transformer.rel_bias_indices[:seq_len, :seq_len]) # type:ignore
@@ -214,7 +209,7 @@ class Transformer(nn.Module):
             self.initialize_architecture()  # uses saved cfg to make the layers
 
     def initialize_architecture(self):
-        assert self.cfg.posn_embed_type in ["base_sinusoid", "base_learnable", "relative", "none", "rel_bias"]
+        assert self.cfg.posn_embed_type in ["base_sinusoid", "base_learnable", "relative", "none", "rel_bias", "rotary"]
 
 
         if self.cfg.posn_embed_type == "relative":  # register these only once to save memory
@@ -237,6 +232,9 @@ class Transformer(nn.Module):
             self.posn_embed = nn.Embedding(self.cfg.block_size, self.cfg.vec_size)
         elif self.cfg.posn_embed_type == "base_sinusoid":
             self.register_buffer("posn_embed", net_utils.sinusoid_matrix(self.cfg.block_size, self.cfg.vec_size))
+        elif self.cfg.posn_embed_type == "rotary":
+            freqs = net_utils.get_rotary_freqs(self.cfg.block_size, 10_000, self.cfg.rotary_dim)
+            self.rotary_freqs = nn.Parameter(freqs, requires_grad=self.cfg.rotary_learnable_freqs)
 
         # lower left triangle (rows = correspond to given location, left/right within a row (cols) = where we are attending to)
         # register_buffer = untrainable parameter, but gets moved onto/off GPU as requested when doing model.to()

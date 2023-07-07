@@ -9,10 +9,6 @@ class ExperimentCfg:
     vec_size: int = 1536
     n_heads: int = 12
     n_layer: int = 12
-    posn_embed_type: str = "base"  # must be in ['base_sinusoid', 'base_learnable', 'relative', 'none', 'rel_bias']
-    rel_bias_max_posn: int = 128  # only has effect if posn_embed_type == "rel_bias"
-    rel_bias_num_buckets: int = 32  # only has effect if posn_embed_type == "rel_bias"
-    relative_float32_attn: bool = False  # if posn_embed_type =="relative", force float32 in relative_posn attention computation
     layer_norm_posn: str = "weird"
     block_size: int = 2048
     flash: bool = True  # whether to use Flash attention or not
@@ -24,6 +20,18 @@ class ExperimentCfg:
     normalizer_eps: float = 1e-8   # eps for making sure divide by zero doesn't happen when normalizing
     normalizer_type: str = "LayerNorm"  # must be one of "LayerNorm", "RMSNorm"
     rmsnorm_p: float = 1.0  # only has effect if normalizer_type == "RMSNorm", in which case it becomes pRMSNorm
+
+    # Position embedding stuff
+    posn_embed_type: str = "base"  # must be in ['base_sinusoid', 'base_learnable', 'relative', 'none', 'rel_bias', 'rotary']
+    # rel_bias
+    rel_bias_max_posn: int = 128  # only has effect if posn_embed_type == "rel_bias"
+    rel_bias_num_buckets: int = 32  # only has effect if posn_embed_type == "rel_bias"
+    # relative
+    relative_float32_attn: bool = False  # if posn_embed_type =="relative", force float32 in relative_posn attention computation
+    # rotary
+    rotary_dim: int = 64  # if posn_embed_type=='rotary', set the max number of hidden dims to rotate
+    rotary_learnable_freqs: bool = False # if posn_embed_type=='rotary', set freqs to be learnable or not
+
 
 
     # Dropout
