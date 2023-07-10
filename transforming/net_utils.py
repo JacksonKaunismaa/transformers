@@ -40,14 +40,7 @@ class Resumer():
         self.model_save_path = osp.join(self.model_ckpt_dir, str(self.job_id), self.name)
         print("Updated save path to", self.model_save_path)
 
-    def save(self, optim=None, **kwargs):  # kwargs should contain optimizer,scheduler, and scaler
-        if utils.get_rank() == 0:   # update resume file
-            with open(self.resume_path, "w") as f:
-                resume_info = dict(wandb_run_id=self.wandb_run_id,
-                                   cfg=dataclasses.asdict(self.net.cfg),
-                                   model_save_path=self.model_save_path)
-                json.dump(resume_info, f, indent=True)
-        
+    def save(self, optim=None, **kwargs):  # kwargs should contain optimizer,scheduler, and scaler        
         # save state_dicts
         save_dict = {"model": self.net.state_dict(),
                      "cfg": self.net.cfg,
@@ -64,7 +57,11 @@ class Resumer():
             if utils.get_rank() == 0:
                 # rprint("is saving", optim.state_dict().keys())
                 rprint("saving num_params", len(optim.state_dict()["param_groups"][0]["params"]))
-                rprint("state_dict device is", optim.state_dict()["state"][0]["exp_avg"].device)
+                try:
+                    rprint("state_dict device is", optim.state_dict()["state"][0]["exp_avg"].device)
+                except KeyError as e:
+                    rprint("error happened on getting device of state dict", e)
+                    rprint("state_dict keys are", optim.state_dict()["state"].keys())
                 save_dict["optim"] = optim.state_dict()  # it transfers shards to CPU first, so GPU mem is fine
             rprint("done consolidating")
         elif optim is not None:
@@ -76,6 +73,14 @@ class Resumer():
         if utils.get_rank() == 0: # only do the actual IO if rank == 0
             rprint("saving being done")
             torch.save(save_dict, self.model_save_path)  # type: ignore 
+
+        if utils.get_rank() == 0:   # update resume file, only actually create this file once the model_state dict is saved
+            with open(self.resume_path, "w") as f:
+                resume_info = dict(wandb_run_id=self.wandb_run_id,
+                                   cfg=dataclasses.asdict(self.net.cfg),
+                                   model_save_path=self.model_save_path)
+                json.dump(resume_info, f, indent=True)
+
 
     def load(self, map_location=None, update_model_save_path=False, **kwargs) -> bool:  # returns True if loading succeeds
         if not osp.exists(self.resume_path):  # if resume_path doesn't even exist, assume this is a fresh run
@@ -109,7 +114,7 @@ class Resumer():
             obj.load_state_dict(load_dict[k])
 
         # make sure all layer sizes, blocks are correctly initialized before loading model state dict
-        self.net.cfg = load_dict["cfg"]  # this shouldn't be necessary since loading optim beforehand requires that it be
+        # self.net.cfg = load_dict["cfg"]  # this shouldn't be necessary since loading optim beforehand requires that it be
         self.net.dset_cfg = load_dict["dset_cfg"]  # correctly initialized already
         # self.initialize_architecture()   # bad for setting up checkpointing reasons
 

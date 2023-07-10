@@ -6,6 +6,7 @@ import torch.multiprocessing as mp
 import os
 import torch._dynamo
 import logging
+import socket
 # import torch._functorch
 
 # import transformers
@@ -91,11 +92,13 @@ if __name__ == "__main__":
     args = parser.parse_args()
     print(args)
     print("cuda state", torch.cuda.is_available(), torch.cuda.device_count())
+    print("running on node ", socket.gethostname())
     if args.nnodes > 1 or args.local_world_size > 1:
         if "MASTER_ADDR" not in os.environ:
             os.environ["MASTER_ADDR"] = "127.0.0.1"
         if "MASTER_PORT" not in os.environ:
             os.environ["MASTER_PORT"] = utils.get_random_unused_port()
+        print("about to spawn with addr", os.environ["MASTER_ADDR"], "port", os.environ["MASTER_PORT"])
         mp.spawn(main, args=(args, data_dir), nprocs=args.local_world_size) # type: ignore
     else:
         main(None, args, data_dir)

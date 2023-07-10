@@ -106,8 +106,6 @@ def run_experiment(dsets, proj_name, resume_path, exp_config: config_objects.Exp
     return train_result
 
 
-
-
 def train(net, resumer, scaler, scheduler, optimizer, exp_config: config_objects.ExperimentCfg, dsets, log_wandb):
     # TODO: consider changing this weird iterated dictionary thing into something clearer
     # maybe another class or only track the current epoch and do it with a {"loss", "perp", "accu"}
