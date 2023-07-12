@@ -307,8 +307,11 @@ class Transformer(nn.Module):
                 return loss, out
 
     @torch.no_grad()  # batched sampling
-    def generate(self, encoder, prompt: Union[str, List[int], torch.Tensor], temperature=0.2) -> List[str]:
+    def generate(self, encoder, prompt: Union[str, List[int], torch.Tensor], temperature=None) -> List[str]:
         self.eval()
+        if temperature is None:
+            temperature = self.cfg.default_temperature
+            
         if isinstance(prompt, str):
             prompt = encoder.encode(prompt)
         
@@ -325,7 +328,7 @@ class Transformer(nn.Module):
         finished_sentences = []
         while tokens.shape[0] != 0:
             # unsqueeze to add batch dim, 0 to rm it, -1 to see last posn in sequence
-            logits = self(tokens[:, -self.cfg.block_size:])
+            logits = self(tokens[:, -self.cfg.block_size:])  # probably should add something for models that have unlimited context
             if temperature > 0:
                 logits[:, -1, :] /= temperature
                 probs = F.softmax(logits, dim=-1)  # 0 to select batch, -1 to select last position in sequence
@@ -347,7 +350,7 @@ class Transformer(nn.Module):
             tokens = torch.cat((tokens, next_token), dim=1)  # concat onto seq_len dimension
             retain = list(range(tokens.shape[0]))
             for i, sentence in enumerate(tokens):
-                if sentence[-1] == encoder.eos_token or sentence.shape[0] >= 2*self.cfg.block_size:
+                if sentence[-1] == encoder.eos_token or sentence.shape[0] >= self.cfg.max_generation_len:
                     finished_sentences.append(sentence)
                     retain.remove(i)
                     print("done with", i, "shape was", sentence.shape, "retain is", retain)
@@ -392,7 +395,7 @@ class Transformer(nn.Module):
                     return ckpt.checkpoint(orig_forward, *inputs, preserve_rng_state=False, use_reentrant=False)
                 module.forward = checkpoint_fwd  # type: ignore
 
-        net_utils.traverse_modules(add_checkpointing, self)
+        net_utils.traverse_modules(add_checkpointing, self)  # type: ignore
         # to get model vram, you need to do looped waiting
         # for speed-wise on small, estimates were smoothed with gamma=0.999, sampled at the last step where all are available
         # for small sizes (batch=1, seq_len=10, heads=1, layers=10, vec_size=1280)

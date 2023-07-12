@@ -1,4 +1,5 @@
 import dataclasses
+import copy
 
 # design pattern: only put an entry into a Cfg class if it is the only Cfg object that manages that entry
 # (ie. Cfg objects are "solely responsible" for the entries they own)
@@ -61,7 +62,10 @@ class ExperimentCfg:
     label_smoothing: float = 1e-8  # amount of label smoothing to use
 
     # Misc.
-    job_id: int = 0  # slurm job id / true location of checkpoint
+    job_id: int = 0   # slurm job id / true location of checkpoint
+    num_sample: int = 5  # number of samples to generate when doing evaluation
+    default_temperature: float = 0.2  # default temperature to be assumed (eg. when doing the evaluation step sample generations)
+    max_generation_len: int = 2048  # if we reach max_generation_len tokens without emitting EOS, force stop generating
 
     def __hash__(self):
         return hash(str(self))
@@ -84,11 +88,23 @@ class ExperimentCfg:
 class DatasetCfg:    # to make things easy to pass around and access/save/compare
     dataset_path: str = ""  # based on directory
     chunk_size: int = 50  # how far apart each sample (each of size block_size) is in the dataset
-    num_workers: int = 4    # number of dataloader workers
 
     # to be filled in when creating dataset, dont set these
     vocab_size: int = -1
     total_size: int = -1  # number of tokens in the dataset
+
+
+@dataclasses.dataclass
+class CommaVQDatasetCfg:    # to make things easy to pass around and access/save/compare
+    decoder_path: str = ""  # if any decoding needs to be done, this is the path to the .onnx model that can decode
+    vocab_size: int = 1024 + 2  # 10 bit VQ-VAE tokens + 2 extra tokens of bos and eos
+    split_ranks: bool = False # whether or not to split the dataset among ranks
+
+    def replace(self, **kwargs):
+        other = copy.copy(self)
+        for k,v in kwargs.items():
+            setattr(other, k, v)
+        return other
 
 
 

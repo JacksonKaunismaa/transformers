@@ -13,6 +13,7 @@ def get_time():
 
 
 def get_device_type():
+    # return "cpu"
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 

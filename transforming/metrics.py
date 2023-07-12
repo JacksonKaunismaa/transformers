@@ -28,8 +28,8 @@ def evaluate(net, dsets, exp_config, all_metrics):
     # {metric_name1: {split1: Tensor, split2: Tensor, ...}, metric_name2: {split1: Tensor, split2: Tensor, ...}, ...}
     # set up tensors for sychronization
     # TODO: maybe this should just be a [num_metrics, num_eval] tensor? 
-    epoch_metrics = {k: {split: torch.zeros(min(len(dset), exp_config.num_eval)).to(net.device) 
-                         for split,dset in dsets.items()} 
+    epoch_metrics = {k: {split: torch.zeros(exp_config.num_eval).to(net.device) 
+                         for split in dsets} 
                      for k in all_metrics}
 
     for split in dsets:
@@ -37,8 +37,12 @@ def evaluate(net, dsets, exp_config, all_metrics):
         for i, sample in tqdm(enumerate(dsets[split].dataloader())):
             if i >= exp_config.num_eval:  # so that we don't iterate over the entire training set while estimating tr_loss
                 break
-            # print("started iterating")
+            if isinstance(sample, dict):  # handle commavq dataset
+                sample = sample['xy'].transpose(0,1)
+            # print("started iterating", split)
+            # print(sample)
             x,y = [el.to(net.device, non_blocking=True) for el in sample]
+            # print("transferred sample")
             loss, logits = net(x, y)
             # calculate supported metrics
             for metric_name in epoch_metrics:
@@ -55,6 +59,7 @@ def evaluate(net, dsets, exp_config, all_metrics):
         if exp_config.ddp:
             for metric_name in epoch_metrics.keys():  # do this since you shouldn't iterate over a thing you are modifying
                 # print("rank", utils.get_rank(), "starting all_reduce on ", metric_name, epoch_metrics[metric_name][split])
+                # print(epoch_metrics[metric_name][split])
                 dist.all_reduce(epoch_metrics[metric_name][split], op=dist.ReduceOp.SUM)  # sychronize with other processes
                 # print("rank", utils.get_rank(), "finished all_reduce on ", metric_name, epoch_metrics[metric_name][split])
 

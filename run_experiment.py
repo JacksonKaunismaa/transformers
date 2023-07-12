@@ -5,15 +5,19 @@ import argparse
 import torch.multiprocessing as mp
 import os
 import torch._dynamo
-import logging
 import socket
+import datasets as hf
+hf.disable_caching()
 # import torch._functorch
 
 # import transformers
 from transforming.train import run_experiment
-from transforming.config_objects import ExperimentCfg, DatasetCfg
-from transforming.data import IdxDataset
+from transforming.config_objects import ExperimentCfg, DatasetCfg, CommaVQDatasetCfg
+from transforming.text_task.data import IdxDataset
+from transforming.commavq.data import CommaVQDataset
 from transforming import utils
+from transforming.utils import rprint
+from transforming import net_utils
 
 torch.backends.cuda.matmul.allow_tf32 = True # type: ignore
 torch.backends.cudnn.allow_tf32 = True # type: ignore
@@ -21,8 +25,7 @@ torch.backends.cudnn.allow_tf32 = True # type: ignore
 # torch._dynamo.config.verbose = True # type: ignore
 # torch._dynamo.config.log_level = logging.INFO # type: ignore
 
-
-def main(local_rank, args, data_dir):
+def main(local_rank, args):
     if local_rank is not None:
         global_rank = args.rank * args.local_world_size + local_rank
         global_world_size = args.local_world_size * args.nnodes
@@ -32,7 +35,7 @@ def main(local_rank, args, data_dir):
         torch.cuda.set_device(local_rank)  # so that nccl knows we are only using that specific device
         os.environ["LOCAL_RANK"] = str(local_rank)  # so that we can local rank access later (arguably bad design)
     
-    print("hi from proc", utils.get_rank(), "world size is", utils.get_world_size(), torch.cuda.device_count())
+    rprint("hi from proc, world size is", utils.get_world_size(), torch.cuda.device_count())
     for v in ["NCCL_ALGO", "NCCL_PROTO", "NCCL_BUFFSIZE", "NCCL_SOCKET_NTHREADS", "NCCL_NSOCKS_PERTHREAD"]:
         print(v, os.environ.get(v, "not found"))
     exp_config = ExperimentCfg(vec_size=1536,
@@ -40,7 +43,7 @@ def main(local_rank, args, data_dir):
                             n_heads=12,
                             lr_max=2e-4,
                             lr_min=1e-7,
-                            block_size=1024,
+                            block_size=2496,  # 39*64
                             batch_size=2,
                             grad_accum_steps=128,
                             train_steps=500, # num macro batches
@@ -52,43 +55,56 @@ def main(local_rank, args, data_dir):
                             normalizer_type="RMSNorm",
                             rmsnorm_p=0.1,
                             layer_norm_posn="pre",
-                            posn_embed_type="rotary",
-                            relative_float32_attn=False,
+                            posn_embed_type="none",
                             flash=True,
                             learnable_unembed=True,
-                            job_id=args.id
+                            job_id=args.id,
+                            max_generation_len=2496,
+                            num_sample=0
                             )
     if args.dry:  # if dry run, overwrite config with dry_run config
         exp_config = exp_config.get_dry()
 
     exp_config.ddp = local_rank is not None
 
-    dset_config = DatasetCfg(dataset_path=data_dir,
-                            num_workers=args.num_workers,
-                            chunk_size=20
-                            )
-
-    datasets = dict(train=IdxDataset("train.bin", exp_config, dset_config),
-                    eval=IdxDataset("eval.bin", exp_config, dset_config))
     
     utils.barrier()
+    if args.task == "text":
+        data_dir = "/scratch/ssd004/scratch/jackk/1-billion-word-language-modeling-benchmark-r13output"
+        task_name = "transformer-experiments-google-1-billion"
+        dset_config = DatasetCfg(dataset_path=data_dir,
+                                 chunk_size=20)
 
-    run_experiment(datasets, "transformer-experiments-google-1-billion", args.resume_path if not args.dry else "dry.ckpt", 
-                   exp_config, log_wandb=True, resume=True)
+        datasets = dict(train=IdxDataset("train.bin", exp_config, dset_config),
+                        eval=IdxDataset("eval.bin", exp_config, dset_config))
+        sample_method = net_utils.wandb_sample_random_sentences
+
+    elif args.task == "commavq":
+        task_name = "transformer-experiments-commavq"
+        dset_config = CommaVQDatasetCfg(decoder_path="/scratch/ssd004/scratch/jackk/commavq/commavq/models/decoder.onnx")
+        load_ds = hf.load_dataset("commaai/commavq", 
+                                data_dir="/scratch/ssd004/scratch/jackk/commavq/", 
+                                cache_dir="/scratch/ssd004/scratch/jackk/commavq")
+        
+        datasets = dict(train=CommaVQDataset([load_ds[str(i)] for i in range(40)], exp_config, dset_config.replace(split_ranks=True)), # type:ignore
+                        eval=CommaVQDataset(load_ds['40'], exp_config, dset_config, load_decoder=False)) # type:ignore
+        sample_method = net_utils.wandb_sample_random_videos
+
+
+
+    run_experiment(datasets, task_name, args.resume_path if not args.dry else "resumes/dry.ckpt",   # type:ignore
+                   exp_config, sample_method, log_wandb=True, resume=True)                  # type:ignore
 
 
 if __name__ == "__main__":
-    data_dir = "/scratch/ssd004/scratch/jackk/1-billion-word-language-modeling-benchmark-r13output"
-
     parser = argparse.ArgumentParser()
-    parser.add_argument('-j', '--num-workers', default=4, type=int, metavar='N',
-                        help='number of data loading workers (default: 4)')
     parser.add_argument('--rank', default=0, type=int, help="global base rank")
     parser.add_argument('--local-world-size', default=1, type=int, help="all gpu processes")
     parser.add_argument('--nnodes', default=1, type=int, help="number of compute-nodes (local_world_size * nnodes = world_size)")
     parser.add_argument('--dry', action="store_true", help="set this flag to run with a very small network, for debugging purposes")
     parser.add_argument('--id', default=0, type=int, help="Slurm job id (for true location of checkpoint)")
     parser.add_argument('--resume-path', help="Path of resume file where model cfg, save path, and wandb_run_id will be stored")
+    parser.add_argument('--task', help="Select which type of dataset to use", choices=["commavq", "text"], default='text')
     args = parser.parse_args()
     print(args)
     print("cuda state", torch.cuda.is_available(), torch.cuda.device_count())
@@ -99,6 +115,6 @@ if __name__ == "__main__":
         if "MASTER_PORT" not in os.environ:
             os.environ["MASTER_PORT"] = utils.get_random_unused_port()
         print("about to spawn with addr", os.environ["MASTER_ADDR"], "port", os.environ["MASTER_PORT"])
-        mp.spawn(main, args=(args, data_dir), nprocs=args.local_world_size) # type: ignore
+        mp.spawn(main, args=(args,), nprocs=args.local_world_size) # type: ignore
     else:
-        main(None, args, data_dir)
+        main(None, args)

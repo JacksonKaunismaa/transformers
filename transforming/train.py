@@ -14,13 +14,13 @@ import time
 
 from . import config_objects
 from . import network
-from . import data
 from . import utils
 from . import metrics
 from . import net_utils
 from .utils import rprint
 
-def run_experiment(dsets, proj_name, resume_path, exp_config: config_objects.ExperimentCfg, log_wandb=True, resume=True):
+def run_experiment(dsets, proj_name, resume_path, exp_config: config_objects.ExperimentCfg, sample_method, 
+                   log_wandb=True, resume=True):
     net = network.Transformer(exp_config, dsets["train"].cfg, no_init=True)
     resumer = net_utils.Resumer(resume_path, net, resume=resume)  # updates exp_config and net.cfg if resume file found
     net.initialize_architecture()  # create layers based on updated exp_config
@@ -95,7 +95,7 @@ def run_experiment(dsets, proj_name, resume_path, exp_config: config_objects.Exp
     # print("done logging network params usage alon")
 
 
-    train_result = train(net, resumer, scaler, sched, optim, exp_config, dsets, log_wandb)
+    train_result = train(net, resumer, scaler, sched, optim, exp_config, dsets, log_wandb, sample_method)
     
     if log_wandb and utils.get_rank() == 0:
         wandb.finish()
@@ -106,7 +106,7 @@ def run_experiment(dsets, proj_name, resume_path, exp_config: config_objects.Exp
     return train_result
 
 
-def train(net, resumer, scaler, scheduler, optimizer, exp_config: config_objects.ExperimentCfg, dsets, log_wandb):
+def train(net, resumer, scaler, scheduler, optimizer, exp_config: config_objects.ExperimentCfg, dsets, log_wandb, sample_method):
     # TODO: consider changing this weird iterated dictionary thing into something clearer
     # maybe another class or only track the current epoch and do it with a {"loss", "perp", "accu"}
     # then you don't have to compute "shortened" names, the code is simpler. Another option is to 
@@ -114,7 +114,7 @@ def train(net, resumer, scaler, scheduler, optimizer, exp_config: config_objects
     # the advantage is you don't have to any extra work for extracting the most recent epoch's results.
     all_metrics = {k: dict(train=[], eval=[]) for k in ["loss", "perplexity", "accuracy"]}
 
-    tr_loader = data.make_infinite(dsets["train"].dataloader())
+    tr_loader = dsets["train"].dataloader()
     non_ddp_net = utils.get_raw(net)  # slight hack to get at the underlying Transformer object consistently
 
     # num tokens in an "epoch" 
@@ -134,6 +134,10 @@ def train(net, resumer, scaler, scheduler, optimizer, exp_config: config_objects
 
             for i in range(grad_accum_steps):  # compute gradients for a single macro-batch
                 sample = next(tr_loader)  # TODO: maybe move getting the next sample to after the forward pass, to overlap better
+                if isinstance(sample, dict):  # handle commavq dataset
+                    sample = sample['xy'].transpose(0,1)  # switch batch and x vs. y dimension
+                # rprint(sample.shape, sample.device)
+                # rprint(len([el for el in sample]))
                 x,y = [el.to(net.device, non_blocking=True) for el in sample]
                 if exp_config.ddp:   # only bother doing sync when doing the very last .backward() before an optimizer step
                     net.require_backward_grad_sync = ((i+1) % grad_accum_steps == 0)
@@ -156,12 +160,12 @@ def train(net, resumer, scaler, scheduler, optimizer, exp_config: config_objects
         epoch_summary = f'Iter {curr_iter}: ' + " ".join(f"{name}: {val:.4f}" for name,val in short_name_metrics.items())
         if utils.get_rank() == 0:  # only 1 process needs to do this
             if log_wandb:
-                rand_sentences = [[curr_iter, sent] for sent in net_utils.sample_random_sentences(non_ddp_net, dsets)]
+                rand_samples = sample_method(non_ddp_net, dsets, curr_iter)
                 wandb.log({**short_name_metrics,
-                        "lr": optimizer.param_groups[0]["lr"],
-                        "tok_time": epoch_time/(epoch_tokens/utils.get_world_size()),
-                        "rand_sentences": wandb.Table(columns=["step", "sentence"], data=rand_sentences),
-                        "step": curr_iter
+                           **rand_samples,  # named version of the "generate samples" concept, will just be {str: wandb_obj}, len=1
+                           "lr": optimizer.param_groups[0]["lr"],
+                           "tok_time": epoch_time/(epoch_tokens/utils.get_world_size()),
+                           "step": curr_iter
                         })#, step=curr_iter)  # TODO: fix this for future projectss
             print(epoch_summary)
         #rprint("checking whether to save, best was", non_ddp_net.best_loss, "last loss was", all_metrics["loss"]["eval"][-1])

@@ -5,6 +5,7 @@ import os.path as osp
 import glob
 import json
 import dataclasses
+import wandb
 
 from . import utils
 from .utils import rprint
@@ -221,6 +222,7 @@ def rotate_q_and_k(q, k, freqs):
 
 
 # GENERATING RANDOM SENTENCES
+# for text task, randomly samples from words in the dataset that start sentences
 def sample_random_start_word(dset):   # for generating the samples to show qualitative progress over time
     while True:  # look over all(-ish) sentence starting words in the dataset, pick one at random
         idx = np.random.randint(0, len(dset))
@@ -230,13 +232,27 @@ def sample_random_start_word(dset):   # for generating the samples to show quali
         except:  # so just wrap it in a try except until it works
             pass
     
-# sample generate a bunch of sentences using random start words
-def sample_random_sentences(net, dsets, num_sample=5, temperature=0.2):
-    start_tokens = [sample_random_start_word(dsets["eval"]) for _ in range(num_sample)]
+# generic sampling function, takes in a function that produces start words for each of the samples
+def generate_samples(net, dsets, start_token_func, num_samples=None, temperature=None):
+    if num_samples is None:
+        num_samples = net.cfg.num_sample
+    start_tokens = [start_token_func(dsets["eval"]) for _ in range(num_samples)]
     stacked_tokens = torch.tensor(start_tokens).unsqueeze(-1).to(net.device)  # (num_samples, 1)
     # print("found start tokens", start_tokens, dsets["eval"].encoder.decode(start_tokens))
     return net.generate(dsets["eval"].encoder, stacked_tokens, temperature=temperature) 
 
+
+# wrapper for generate_samples that returns randomly generated sentences in a format usable for wandb logging (task == 'text')
+def wandb_sample_random_sentences(net, dsets, step):
+    rand_sentences = [[step, sent] for sent in generate_samples(net, dsets, sample_random_start_word)]
+    return {"rand_sentences": wandb.Table(columns=["step", "sentence"], data=rand_sentences)}
+
+
+# wrapper for generate_samples that returns randomly generated videos in a format usable for wandb logging (task == 'commavq')
+def wandb_sample_random_videos(net, dsets, step):
+    start_token_func = lambda x: dsets["eval"].encoder.bos_token
+    rand_videos = [video for video in generate_samples(net, dsets, start_token_func)]
+    return {f"video{i}": video for i, video in enumerate(rand_videos)}
 
 
 # ACTIVATION CHECKPOINTING (and potentially saving activations)
