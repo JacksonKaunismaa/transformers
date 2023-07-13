@@ -290,20 +290,24 @@ class Transformer(nn.Module):
             for i, block in enumerate(self.blocks):
                 # if i == 1:  #
                 #     return x
+                # print(i, x.shape)
                 # print(i, torch.topk(x.flatten().abs(), 5).values, x.norm()) 
                 x = block(x)  # (batch, seq_len, vec_size)
+            # print("final shape", x.shape)
+            # print("target shape", targets.shape)
             
             if self.cfg.learnable_unembed:
                 out = self.unembed(x)  # (batch, seq_len, vec_size) @ (vec_size, vocab_size) 
             else:
                 out = x @ self.embed.weight.T
+            # print("out", out.shape, self.dset_cfg.vocab_size)
 
             if targets is None:  # ie. inference mode, return logits so we can do temperature stuff
                 return out   # F.softmax(out, dim=-1)
             else:  # flatten across batches and positions so that we can compare indices (in `targets`) to distributions (in `out`)
                 #print(out, targets)
                 #print(F.cross_entropy(out.view(-1, self.dset_cfg.vocab_size), targets.view(-1)))
-                loss = F.cross_entropy(out.view(-1, self.dset_cfg.vocab_size), targets.view(-1), label_smoothing=self.cfg.label_smoothing)
+                loss = F.cross_entropy(out.reshape(-1, self.dset_cfg.vocab_size), targets.reshape(-1), label_smoothing=self.cfg.label_smoothing)
                 return loss, out
 
     @torch.no_grad()  # batched sampling

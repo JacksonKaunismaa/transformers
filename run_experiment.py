@@ -38,15 +38,17 @@ def main(local_rank, args):
     rprint("hi from proc, world size is", utils.get_world_size(), torch.cuda.device_count())
     for v in ["NCCL_ALGO", "NCCL_PROTO", "NCCL_BUFFSIZE", "NCCL_SOCKET_NTHREADS", "NCCL_NSOCKS_PERTHREAD"]:
         print(v, os.environ.get(v, "not found"))
-    exp_config = ExperimentCfg(vec_size=1536,
-                            n_layer=12,
-                            n_heads=12,
-                            lr_max=2e-4,
+    exp_config = ExperimentCfg(vec_size=1408,
+                            n_layer=18,
+                            n_heads=11,
+                            lr_max=2e-4*1.3,  # *1.3 since our batches are too large by about 30%
                             lr_min=1e-7,
+                            t_warmup=50_000,  # there are 15B tokens roughly, so this means we iterate over the data about 1x
+                            total_steps=50_000,  # since our model uses ~500M parameters, this is the right-ish amount
                             block_size=2496,  # 39*64
                             batch_size=2,
-                            grad_accum_steps=128,
-                            train_steps=500, # num macro batches
+                            grad_accum_steps=64,  # 2*32
+                            train_steps=500, # num macro batches, need to make this small for pre-emption purposes
                             num_eval=300,  # num micro batches
                             dtype="float16",
                             compile=True,
@@ -55,7 +57,7 @@ def main(local_rank, args):
                             normalizer_type="RMSNorm",
                             rmsnorm_p=0.1,
                             layer_norm_posn="pre",
-                            posn_embed_type="none",
+                            posn_embed_type="rotary",
                             flash=True,
                             learnable_unembed=True,
                             job_id=args.id,
