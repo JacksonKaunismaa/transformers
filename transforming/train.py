@@ -166,7 +166,7 @@ def train(net, resumer, scaler, scheduler, optimizer, exp_config: config_objects
                            "lr": optimizer.param_groups[0]["lr"],
                            "tok_time": epoch_time/(epoch_tokens/utils.get_world_size()),
                            "step": curr_iter
-                        }, step=curr_iter)
+                        })
             print(epoch_summary)
         #rprint("checking whether to save, best was", non_ddp_net.best_loss, "last loss was", all_metrics["loss"]["eval"][-1])
         if all_metrics["loss"]["eval"][-1] < non_ddp_net.best_loss or all_metrics["loss"]["eval"][-1].isnan().any(): # type: ignore  
