@@ -91,7 +91,10 @@ class MultiHeadAttention(nn.Module):
             self.posn_vect_v = nn.Parameter(torch.zeros(1, cfg.n_heads, 1, self.head_size))
             self.posn_key_mat = nn.Linear(cfg.vec_size, cfg.vec_size, bias=False)  # W_k,R in their notation
 
-        self.qkv = nn.Linear(cfg.vec_size, 3*cfg.vec_size, bias=False)
+        if cfg.mqa_attn:
+            self.qkv = nn.Linear(cfg.vec_size, cfg.vec_size + 2*self.head_size, bias=False)
+        else:
+            self.qkv = nn.Linear(cfg.vec_size, 3*cfg.vec_size, bias=False)
         self.out = nn.Linear(cfg.vec_size, cfg.vec_size, bias=False)
 
         self.attn_dropout = nn.Dropout(p=cfg.dropout_attn)
@@ -104,10 +107,18 @@ class MultiHeadAttention(nn.Module):
         batch, seq_len, _ = x.shape
         # print(x.shape)
         # x_head = x.view(batch, seq_len, self.n_heads, self.head_size)
-        qkv = torch.split(self.qkv(x), self.cfg.vec_size, dim=-1)  # q,k,v are (batch, seq_len, vec_size)
+        qkv = self.qkv(x)
+        if self.cfg.mqa_attn:
+            qkv = (qkv[..., :self.cfg.vec_size],   # q (batch, seq_len, vec_size)
+                   qkv[..., self.cfg.vec_size:self.cfg.vec_size+self.head_size],  # k (batch, seq_len, head_size)
+                   qkv[..., self.cfg.vec_size+self.head_size:])  # v (batch, seq_len, head_size)
+        else:
+            qkv = torch.split(qkv, self.cfg.vec_size, dim=-1)  # q,k,v are (batch, seq_len, vec_size)
+        
         # transpose so that multiplications are done to each position, not each head
-        # q,k,v are now (batch, n_head, seq_len, head_size)
-        q,k,v = [mat.view(batch, seq_len, self.cfg.n_heads, self.head_size).transpose(1,2) for mat in qkv]
+        # q,k,v are now (batch, n_heads, seq_len, head_size), (n_heads=1 for k,v if mqa_attn=True)
+        # we use the -1 so that for mqa_attn, the n_heads can be inferred as 1 
+        q,k,v = [mat.view(batch, seq_len, -1, self.head_size).transpose(1,2) for mat in qkv]
 
         if self.cfg.posn_embed_type == "rotary":
             q, k = net_utils.rotate_q_and_k(q, k, self.main_transformer.rotary_freqs) # type: ignore
@@ -246,8 +257,12 @@ class Transformer(nn.Module):
 
         self.blocks = nn.ModuleList([TransformerBlock(self.cfg, self) for _ in range(self.cfg.n_layer)])
 
-        if self.cfg.learnable_unembed:
-            self.unembed = nn.Linear(self.cfg.vec_size, self.dset_cfg.vocab_size, bias=False)
+        self.unembed = nn.Linear(self.cfg.vec_size, self.dset_cfg.vocab_size, bias=False)
+        # gives the embed matrix a smaller initialization (nanoGPT approach), hopefully makes training more stable
+        if not self.cfg.learnable_unembed:  # nn.Embedding gives it a standard normal, this gives it a uniform distrib
+            self.embed.weight = self.unembed.weight  # with width ~4.5e-3, for a variance of 6.6e-6 (if vocab_size=50_304)
+
+
 
         # set up autocasting
         rprint(utils.get_device_type(), "deiece")
@@ -296,11 +311,7 @@ class Transformer(nn.Module):
             # print("final shape", x.shape)
             # print("target shape", targets.shape)
             
-            if self.cfg.learnable_unembed:
-                out = self.unembed(x)  # (batch, seq_len, vec_size) @ (vec_size, vocab_size) 
-            else:
-                out = x @ self.embed.weight.T
-            # print("out", out.shape, self.dset_cfg.vocab_size)
+            out = self.unembed(x)  # (batch, seq_len, vec_size) @ (vec_size, vocab_size) 
 
             if targets is None:  # ie. inference mode, return logits so we can do temperature stuff
                 return out   # F.softmax(out, dim=-1)
@@ -308,7 +319,7 @@ class Transformer(nn.Module):
                 #print(out, targets)
                 #print(F.cross_entropy(out.view(-1, self.dset_cfg.vocab_size), targets.view(-1)))
                 loss = F.cross_entropy(out.reshape(-1, self.dset_cfg.vocab_size), targets.reshape(-1), label_smoothing=self.cfg.label_smoothing)
-                return loss, out
+                return out, loss
 
     @torch.no_grad()  # batched sampling
     def generate(self, encoder, prompt: Union[str, List[int], torch.Tensor], temperature=None) -> List[str]:

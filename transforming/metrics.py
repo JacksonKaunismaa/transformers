@@ -4,6 +4,7 @@ from tqdm import tqdm
 import torch.nn.functional as F
 
 from . import utils
+from .utils import oprint
 
 @torch.no_grad()
 def accuracy(logits, targets):
@@ -31,6 +32,8 @@ def evaluate(net, dsets, exp_config, all_metrics):
     epoch_metrics = {k: {split: torch.zeros(exp_config.num_eval).to(net.device) 
                          for split in dsets} 
                      for k in all_metrics}
+    
+    oprint("starting evaluation at", utils.get_time())
 
     for split in dsets:
         # print("starting split", split, utils.get_rank(), utils.get_time())
@@ -43,7 +46,7 @@ def evaluate(net, dsets, exp_config, all_metrics):
             # print(sample)
             x,y = [el.to(net.device, non_blocking=True) for el in sample]
             # print("transferred sample")
-            loss, logits = net(x, y)
+            logits, loss = net(x, y)  # match nanoGPT order of return
             # calculate supported metrics
             for metric_name in epoch_metrics:
                 if metric_name == "loss":  # calculate the metrics that are requested
@@ -73,3 +76,4 @@ def evaluate(net, dsets, exp_config, all_metrics):
         # print("rank", utils.get_rank(), "finished on split", split)
         utils.barrier()
     net.train()
+    oprint("finished evaluation at", utils.get_time())

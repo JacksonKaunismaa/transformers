@@ -13,6 +13,7 @@ class ExperimentCfg:
     layer_norm_posn: str = "weird"
     block_size: int = 2048
     flash: bool = True  # whether to use Flash attention or not
+    mqa_attn: bool = False  # whether to use multi query attention or not
     dtype: str = "bfloat16"  # float32, float16, and bfloat16 are supported (for mixed precision)
     linear_bias: bool = False  # enable/disable biases for all MLP Linear layers
     learnable_unembed: bool = True  # enable/disable having the unembed matrix be seperately learnable from the embedding matrix
@@ -97,7 +98,7 @@ class DatasetCfg:    # to make things easy to pass around and access/save/compar
 @dataclasses.dataclass
 class CommaVQDatasetCfg:    # to make things easy to pass around and access/save/compare
     decoder_path: str = ""  # if any decoding needs to be done, this is the path to the .onnx model that can decode
-    vocab_size: int = 1024 + 2  # 10 bit VQ-VAE tokens + 2 extra tokens of bos and eos
+    vocab_size: int = 1024 + 2 + 62  # 10bit VQ-VAE tokens + bos + eos + 62 to be a multiple of 64
     split_ranks: bool = False # whether or not to split the dataset among ranks
 
     def replace(self, **kwargs):

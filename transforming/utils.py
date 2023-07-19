@@ -1,5 +1,6 @@
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch._dynamo.eval_frame import OptimizedModule
 import time
 import torch
 import numpy as np
@@ -19,6 +20,10 @@ def get_device_type():
 
 def rprint(*args, **kwargs):
     print("rank", get_rank(), *args, **kwargs)
+
+def oprint(*args, **kwargs):
+    if get_rank() == 0:
+        print(*args, **kwargs)
 
 
 def get_random_unused_port():
@@ -55,4 +60,8 @@ def barrier():
     
 
 def get_raw(net): # slightly awkward way to consistently access underyling Transformer object
-    return net.module if isinstance(net, DDP) else net
+    if isinstance(net, OptimizedModule):
+        net = net._modules["_orig_mod"]
+    if isinstance(net, DDP):
+        net = net.module
+    return net

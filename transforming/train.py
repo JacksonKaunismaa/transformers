@@ -44,8 +44,8 @@ def run_experiment(dsets, proj_name, resume_path, exp_config: config_objects.Exp
     net = net.to(device)
     # #rprint("setting device to", exp_config.device, net.cfg.device)
 
-    if exp_config.compile:
-        print("Compiling model...")
+    if exp_config.compile:  # should do compile after DDP due to extra optimizations that can be applied
+        print("Compiling model...")  # in practice, its slower though
         net = torch.compile(net)
 
     if exp_config.ddp:
@@ -53,6 +53,8 @@ def run_experiment(dsets, proj_name, resume_path, exp_config: config_objects.Exp
             torch.cuda.device_count(), "dev_id", device_id, device, "localr", utils.get_local_rank(),
             os.environ["MASTER_ADDR"], os.environ["MASTER_PORT"], "bad")
         net = DDP(net, device_ids=[device_id], output_device=device_id)
+    
+
         # [print(utils.get_local_rank(), torch.cuda.memory_allocated(n)) for n in range(torch.cuda.device_count())]
 
     # with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
@@ -67,7 +69,7 @@ def run_experiment(dsets, proj_name, resume_path, exp_config: config_objects.Exp
     # return
 
     # #rprint("setting device to", exp_config.device, net.cfg.device)
-    scaler, sched, optim = utils.get_raw(net).get_optim()
+    scaler, sched, optim = utils.get_raw(net).get_optim()  # type:ignore
 
     if resume:
         map_location = device  # make sure we load to the right device
@@ -170,7 +172,7 @@ def train(net, resumer, scaler, scheduler, optimizer, exp_config: config_objects
             print(epoch_summary)
         #rprint("checking whether to save, best was", non_ddp_net.best_loss, "last loss was", all_metrics["loss"]["eval"][-1])
         if all_metrics["loss"]["eval"][-1] < non_ddp_net.best_loss or all_metrics["loss"]["eval"][-1].isnan().any(): # type: ignore  
-            non_ddp_net.best_loss = all_metrics["loss"]["eval"][-1]
+            non_ddp_net.best_loss = all_metrics["loss"]["eval"][-1]  # type:ignore
             # if utils.get_rank() == 0:  # put rank check here so that all ranks have consistent .best_loss
             # need to disable the rank check here since sharded optimizer requires all ranks to consolidate
             resumer.save(scaler=scaler, optim=optimizer, sched=scheduler)

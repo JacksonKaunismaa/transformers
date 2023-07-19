@@ -39,29 +39,31 @@ def main(local_rank, args):
     for v in ["NCCL_ALGO", "NCCL_PROTO", "NCCL_BUFFSIZE", "NCCL_SOCKET_NTHREADS", "NCCL_NSOCKS_PERTHREAD"]:
         print(v, os.environ.get(v, "not found"))
     exp_config = ExperimentCfg(vec_size=1408,
-                            n_layer=18,
+                            n_layer=22,
                             n_heads=11,
-                            lr_max=2e-4*1.3,  # *1.3 since our batches are too large by about 30%
+                            lr_max=2e-4,
                             lr_min=1e-7,
-                            t_warmup=50_000,  # there are 15B tokens roughly, so this means we iterate over the data about 1x
+                            t_decay=50_000,  # there are 15B tokens roughly, so this means we iterate over the data about 1x
                             total_steps=50_000,  # since our model uses ~500M parameters, this is the right-ish amount
-                            block_size=2496,  # 39*64
-                            batch_size=2,
-                            grad_accum_steps=64,  # 2*32
-                            train_steps=500, # num macro batches, need to make this small for pre-emption purposes
+                            block_size=2624,  # 41*64
+                            batch_size=1,
+                            grad_accum_steps=144,  # 2*48
+                            train_steps=550, # num macro batches, need to make this small for pre-emption purposes
                             num_eval=300,  # num micro batches
                             dtype="float16",
                             compile=True,
                             zero=True,
                             checkpointing=False,
                             normalizer_type="RMSNorm",
-                            rmsnorm_p=0.1,
+                            rmsnorm_p=0.07,
                             layer_norm_posn="pre",
                             posn_embed_type="rotary",
+                            rotary_dim=64,
                             flash=True,
+                            mqa_attn=True,
                             learnable_unembed=True,
                             job_id=args.id,
-                            max_generation_len=2496,
+                            max_generation_len=2624,
                             num_sample=0
                             )
     if args.dry:  # if dry run, overwrite config with dry_run config

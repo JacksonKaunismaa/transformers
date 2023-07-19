@@ -8,7 +8,7 @@ import dataclasses
 import wandb
 
 from . import utils
-from .utils import rprint
+from .utils import rprint, oprint
 
 class Resumer():
     def __init__(self, resume_path, net, resume=True, model_ckpt_dir="/checkpoint/jackk"):
@@ -17,7 +17,7 @@ class Resumer():
 
         self.wandb_run_id = None
         self.model_save_path = None
-        self.job_id = net.cfg.job_id
+        self.job_id = net.cfg.job_id   # consume correct, new job_id from net.cfg before it gets overwritten by old config
         self.net = net
 
         if osp.exists(resume_path):
@@ -43,6 +43,7 @@ class Resumer():
 
     def save(self, optim=None, **kwargs):  # kwargs should contain optimizer,scheduler, and scaler        
         # save state_dicts
+        oprint("starting saving")
         save_dict = {"model": self.net.state_dict(),
                      "cfg": self.net.cfg,
                      "dset_cfg": self.net.dset_cfg,
@@ -81,6 +82,7 @@ class Resumer():
                                    cfg=dataclasses.asdict(self.net.cfg),
                                    model_save_path=self.model_save_path)
                 json.dump(resume_info, f, indent=True)
+        oprint("done saving")
 
 
     def load(self, map_location=None, update_model_save_path=False, **kwargs) -> bool:  # returns True if loading succeeds
@@ -116,8 +118,15 @@ class Resumer():
 
         # make sure all layer sizes, blocks are correctly initialized before loading model state dict
         # self.net.cfg = load_dict["cfg"]  # this shouldn't be necessary since loading optim beforehand requires that it be
+        if self.net.dset_cfg.vocab_size != load_dict["dset_cfg"]['vocab_size']:  # since we expanded vocab size halfway through,
+            new_size = self.net.dset_cfg.vocab_size  # add some dummy entries to the saved weights (we don't use those tokens
+            old_size = load_dict["dset_cfg"]['vocab_size']  # anyway, its just for efficiency reasons)
+            load_dict['model']['embed'] = torch.cat([load_dict['model']['embed'], 
+                                                     torch.zeros(new_size-old_size, self.net.cfg.vec_size, device=map_location)])
+            load_dict['model']['unembed'] = torch.cat([load_dict['model']['unembed'], 
+                                                       torch.zeros(new_size-old_size, self.net.cfg.vec_size, device=map_location)])
+
         self.net.dset_cfg = load_dict["dset_cfg"]  # correctly initialized already
-        # self.initialize_architecture()   # bad for setting up checkpointing reasons
 
         # there should probably just be a thing that just regenerates all buffers based on the new cfg, rather than loading them in
         if "shift_indices" in load_dict["model"]:  # adjust for batch size
@@ -214,9 +223,9 @@ def rotate_q_or_k(q_or_k, freqs, rot_dim):
     return torch.cat([t, t_right], dim=-1)   # concatenate rotated part (t) and unrotated part (t_right)
 
 # from https://github.com/lucidrains/rotary-embedding-torch/blob/main/rotary_embedding_torch/rotary_embedding_torch.py#L109
-def rotate_q_and_k(q, k, freqs):
+def rotate_q_and_k(q, k, freqs):  # inpt is (batch, n_heads, seq_len, head_size)
     rot_dim = freqs.shape[-1]  # only use the first rot_dim units of embedding dimension, since effect on units past this
-    freqs = freqs[:q.shape[2]]  # select up to seq_len
+    freqs = freqs[:q.shape[2]]  # select up to seq_len (freqs is (seq_len, rotary_dim))
     return rotate_q_or_k(q, freqs, rot_dim), rotate_q_or_k(k, freqs, rot_dim)
     
 
