@@ -143,7 +143,7 @@ def train(net, resumer, scaler, scheduler, optimizer, exp_config: config_objects
                 x,y = [el.to(net.device, non_blocking=True) for el in sample]
                 if exp_config.ddp:   # only bother doing sync when doing the very last .backward() before an optimizer step
                     net.require_backward_grad_sync = ((i+1) % grad_accum_steps == 0)
-                batch_loss = net(x, y)[0] / grad_accum_steps  # net returns (loss_value, logits) tuple
+                batch_loss = net(x, y)[1] / grad_accum_steps  # net returns (loss_value, logits) tuple
                 scaler.scale(batch_loss).backward()  # accumulate scaled gradients
 
             scaler.unscale_(optimizer)  # unscale so that we can clip propely

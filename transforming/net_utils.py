@@ -43,7 +43,7 @@ class Resumer():
 
     def save(self, optim=None, **kwargs):  # kwargs should contain optimizer,scheduler, and scaler        
         # save state_dicts
-        oprint("starting saving")
+        oprint(f"starting saving, {self.net.best_loss=}")
         save_dict = {"model": self.net.state_dict(),
                      "cfg": self.net.cfg,
                      "dset_cfg": self.net.dset_cfg,
@@ -105,34 +105,41 @@ class Resumer():
         
         print("Found path of", self.model_save_path)
         load_dict = torch.load(self.model_save_path, map_location=map_location)  # load onto cpu so sharded models don't OOM
-        rprint(load_dict["model"].keys())
+        rprint("saved model keys", load_dict["model"].keys())
         rprint("keys", load_dict.keys())
         rprint("is loading to", map_location)
         # rprint("has num_params", len(kwargs["optim"].param_groups[0]["params"]))
+
+        if self.net.dset_cfg.vocab_size != load_dict["dset_cfg"].vocab_size:  # since we expanded vocab size halfway through,
+            new_size = self.net.dset_cfg.vocab_size  # add some dummy entries to the saved weights (we don't use those tokens
+            old_size = load_dict["dset_cfg"].vocab_size  # anyway, its just for efficiency reasons)
+            load_dict['model']['embed.weight'] = add_rows(load_dict['model']['embed.weight'], new_size-old_size, map_location)
+            load_dict['model']['unembed.weight'] = add_rows(load_dict['model']['unembed.weight'], new_size-old_size, map_location)
+                                                       
+            for k in load_dict['optim']['state']:
+                if old_size in load_dict['optim']['state'][k]['exp_avg'].shape:  # unsafe to assume this, but not much else to go on
+                    load_dict['optim']['state'][k]['exp_avg'] = add_rows(load_dict['optim']['state'][k]['exp_avg'], 
+                                                                         new_size-old_size, map_location)
+                    load_dict['optim']['state'][k]['exp_avg_sq'] = add_rows(load_dict['optim']['state'][k]['exp_avg_sq'], 
+                                                                            new_size-old_size, map_location)
+            load_dict['dset_cfg'].vocab_size = new_size
+
+        self.net.dset_cfg = load_dict["dset_cfg"]  # correctly initialized already
+        self.net.best_loss = load_dict["best_loss"]
+
+        # there should probably just be a thing that just regenerates all buffers based on the new cfg, rather than loading them in
+        if "shift_indices" in load_dict["model"]:  # adjust for if the batch size changed
+            load_dict["model"]["shift_indices"] = get_rel_bias_indices(self.net.cfg.block_size,
+                                                                       self.net.cfg.rel_bias_max_posn,
+                                                                       self.net.cfg.rel_bias_num_buckets)
+        # actually start loading state dicts
         for k,obj in kwargs.items():  # load optimizer, scheduler, scaler state dicts
             if k == "optim":
                 # rprint([(i, t.shape) if hasattr(t, "shape") else (i, t, type(t)) for i, t in enumerate(obj.param_groups[0]["params"])])
                 rprint(len(obj.param_groups[0]["params"]), type(obj.param_groups[0]["params"][0]), len(load_dict[k]["param_groups"][0]["params"]))
                 # rprint([(i, t["exp_avg"].shape) for i, t in enumerate(load_dict[k]["state"].values())])
             obj.load_state_dict(load_dict[k])
-
-        # make sure all layer sizes, blocks are correctly initialized before loading model state dict
-        # self.net.cfg = load_dict["cfg"]  # this shouldn't be necessary since loading optim beforehand requires that it be
-        if self.net.dset_cfg.vocab_size != load_dict["dset_cfg"]['vocab_size']:  # since we expanded vocab size halfway through,
-            new_size = self.net.dset_cfg.vocab_size  # add some dummy entries to the saved weights (we don't use those tokens
-            old_size = load_dict["dset_cfg"]['vocab_size']  # anyway, its just for efficiency reasons)
-            load_dict['model']['embed'] = torch.cat([load_dict['model']['embed'], 
-                                                     torch.zeros(new_size-old_size, self.net.cfg.vec_size, device=map_location)])
-            load_dict['model']['unembed'] = torch.cat([load_dict['model']['unembed'], 
-                                                       torch.zeros(new_size-old_size, self.net.cfg.vec_size, device=map_location)])
-
-        self.net.dset_cfg = load_dict["dset_cfg"]  # correctly initialized already
-
-        # there should probably just be a thing that just regenerates all buffers based on the new cfg, rather than loading them in
-        if "shift_indices" in load_dict["model"]:  # adjust for batch size
-            load_dict["model"]["shift_indices"] = load_dict["model"]["shift_indices"][:self.net.cfg.batch_size]
         self.net.load_state_dict(load_dict["model"])
-        self.net.best_loss = load_dict["best_loss"]
 
         if update_model_save_path:  # 1. load model based on value in resume file (potentially old /checkpoint/* dir)
             self.update_model_save_path()  # 2. subsequent saves of the model should be to /checkpoint/curr_job_id/self.name
@@ -140,6 +147,9 @@ class Resumer():
     
 
 
+
+def add_rows(tensor, num_rows, device):
+    return torch.cat([tensor, torch.ones(num_rows, tensor.shape[1], device=device)])
 
 
 def sinusoid_matrix(seq_len, vec_size):  # for position embeddings

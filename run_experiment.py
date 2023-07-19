@@ -38,9 +38,9 @@ def main(local_rank, args):
     rprint("hi from proc, world size is", utils.get_world_size(), torch.cuda.device_count())
     for v in ["NCCL_ALGO", "NCCL_PROTO", "NCCL_BUFFSIZE", "NCCL_SOCKET_NTHREADS", "NCCL_NSOCKS_PERTHREAD"]:
         print(v, os.environ.get(v, "not found"))
-    exp_config = ExperimentCfg(vec_size=1408,
-                            n_layer=22,
-                            n_heads=11,
+    exp_config = ExperimentCfg(vec_size=1024,
+                            n_layer=26,
+                            n_heads=16,
                             lr_max=2e-4,
                             lr_min=1e-7,
                             t_decay=50_000,  # there are 15B tokens roughly, so this means we iterate over the data about 1x

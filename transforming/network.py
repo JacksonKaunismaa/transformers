@@ -262,8 +262,6 @@ class Transformer(nn.Module):
         if not self.cfg.learnable_unembed:  # nn.Embedding gives it a standard normal, this gives it a uniform distrib
             self.embed.weight = self.unembed.weight  # with width ~4.5e-3, for a variance of 6.6e-6 (if vocab_size=50_304)
 
-
-
         # set up autocasting
         rprint(utils.get_device_type(), "deiece")
         if utils.get_device_type() == "cpu":
@@ -274,11 +272,11 @@ class Transformer(nn.Module):
         if self.cfg.checkpointing:
             self.add_activation_checkpointing()
 
-        print(f"Num parameters: {self.num_params()} M")
+        print(f"Num parameters: {self.num_params()/1_000_000} M")
         print(f"Approximate expected train vram usage: {self.expected_vram_size():.2f} GB")
 
-    def num_params(self): # returns num parameters in millions
-        return sum(p.numel() for p in self.parameters() if p.requires_grad) / 1_000_000  
+    def num_params(self):
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
     
     @property  # so that it works through a .to
     def device(self):
@@ -289,7 +287,7 @@ class Transformer(nn.Module):
         dtype_size = int(self.cfg.dtype[-2:]) // 8  # won't work with 128-bit precision or 8-bit precision
         mem_per_layer = self.cfg.block_size * self.cfg.batch_size * self.cfg.vec_size * \
             (34 + 5*self.cfg.n_heads*self.cfg.block_size / self.cfg.vec_size)*dtype_size/2 # since paper assumes float16
-        mem_model = self.num_params() * dtype_size * 4  # *4 since Adam stores 2, gradients is +11
+        mem_model = self.num_params() * (32//8) * 4  # *4 since Adam stores 2, gradients is 1, and model itself is 1
         return (mem_model + mem_per_layer*self.cfg.n_layer) / (1_024**3)
 
     def forward(self, x, targets=None):
