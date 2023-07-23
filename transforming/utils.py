@@ -6,6 +6,11 @@ import torch
 import numpy as np
 import os
 import socket
+from typing import Union, TYPE_CHECKING
+
+
+if TYPE_CHECKING:
+    from .network import Transformer
         
 
 def get_time():
@@ -58,10 +63,11 @@ def barrier():
     except RuntimeError:
         pass
     
-
-def get_raw(net): # slightly awkward way to consistently access underyling Transformer object
+ 
+ # slightly awkward way to consistently access underyling Transformer object
+def get_raw(net: Union[OptimizedModule, DDP, "Transformer"]) -> "Transformer":
     if isinstance(net, OptimizedModule):
-        net = net._modules["_orig_mod"]
+        return get_raw(net._modules["_orig_mod"]) # type: ignore
     if isinstance(net, DDP):
-        net = net.module
-    return net
+        return get_raw(net.module)  # do recursion so its independent of the order of DDP and .compile()
+    return net   # while loop is more annoying due to circular dependency and needing Transformer defined

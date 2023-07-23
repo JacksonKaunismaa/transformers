@@ -6,50 +6,51 @@ import glob
 import json
 import dataclasses
 import wandb
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch._dynamo.eval_frame import OptimizedModule
+from typing import TYPE_CHECKING, Optional, Union
 
 from . import utils
 from .utils import rprint, oprint
 
+if TYPE_CHECKING:
+    from .config_objects import ExperimentCfg
+    from .network import Transformer
+
+
 class Resumer():
-    def __init__(self, resume_path, net, resume=True, model_ckpt_dir="/checkpoint/jackk"):
+    def __init__(self, resume_path: str, job_id: int, model_ckpt_dir="/checkpoint/jackk"):
         self.resume_path = resume_path
         self.model_ckpt_dir = model_ckpt_dir
 
-        self.wandb_run_id = None
-        self.model_save_path = None
-        self.job_id = net.cfg.job_id   # consume correct, new job_id from net.cfg before it gets overwritten by old config
-        self.net = net
+        self.wandb_run_id = ""
+        self.model_save_path = ""
+        self.job_id = job_id
 
-        if osp.exists(resume_path):
-            if resume:
-                self.load()  # this call only loads in resume parameters, sets net.cfg, but doesn't load state_dicts
-            else:
-                existing_paths = glob.glob(osp.join(resume_path, "*"))
-                nums = [int(path.split(".")[-1]) for path in existing_paths] + [0]  # add [0] so there is always at least 1 element
-                next_num = max(nums) + 1
-                self.resume_path = f"{resume_path}.{next_num}"
-                print("Warning: Creating new resume file since you specified an already existing resume path, but resume=False")
-                print("New path is: ", self.resume_path)
+        # if osp.exists(resume_path):
+        #     existing_paths = glob.glob(osp.join(resume_path, "*"))
+        #     nums = [int(path.split(".")[-1]) for path in existing_paths] + [0]  # add [0] so there is always at least 1 element
+        #     next_num = max(nums) + 1
+        #     self.resume_path = f"{resume_path}.{next_num}"
+        #     rprint("Warning: Creating new resume file since you specified an already existing resume path, but resume=False")
+        #     rprint("New path is: ", self.resume_path)
 
         self.name = osp.basename(self.resume_path)
-        if self.model_save_path is None:  # only way in which its set is if resume=True and resume_path exists
-            self.update_model_save_path()    # otherwise, set it to /checkpoint/curr_job_id/name
-
-        print("Model name is", self.name, "will be saving to", self.model_save_path)
+        rprint("Model name is", self.name)
 
     def update_model_save_path(self):
         self.model_save_path = osp.join(self.model_ckpt_dir, str(self.job_id), self.name)
-        print("Updated save path to", self.model_save_path)
+        rprint("Updated save path to", self.model_save_path)
 
-    def save(self, optim=None, **kwargs):  # kwargs should contain optimizer,scheduler, and scaler        
+    def save(self, net: "Transformer", optim=None, **kwargs):  # kwargs should contain optimizer,scheduler, and scaler        
         # save state_dicts
-        oprint(f"starting saving, {self.net.best_loss=}")
-        save_dict = {"model": self.net.state_dict(),
-                     "cfg": self.net.cfg,
-                     "dset_cfg": self.net.dset_cfg,
-                     "best_loss": self.net.best_loss}
+        oprint(f"starting saving, {net.best_loss=}")
+        save_dict = {"model": net.state_dict(),
+                     "cfg": net.cfg,
+                     "dset_cfg": net.dset_cfg,
+                     "best_loss": net.best_loss}
 
-        if self.net.cfg.ddp and self.net.cfg.zero and optim is not None:  # sharded optimizer => need to collate before saving
+        if net.cfg.ddp and net.cfg.zero and optim is not None:  # sharded optimizer => need to collate before saving
             rprint("is consolidating")
             # rprint("Has state", optim.state.keys())
             rprint("pre consolidate, has num_params", len(optim.param_groups[0]["params"]))
@@ -79,39 +80,42 @@ class Resumer():
         if utils.get_rank() == 0:   # update resume file, only actually create this file once the model_state dict is saved
             with open(self.resume_path, "w") as f:
                 resume_info = dict(wandb_run_id=self.wandb_run_id,
-                                   cfg=dataclasses.asdict(self.net.cfg),
+                                   cfg=dataclasses.asdict(net.cfg),
                                    model_save_path=self.model_save_path)
                 json.dump(resume_info, f, indent=True)
         oprint("done saving")
 
 
-    def load(self, map_location=None, update_model_save_path=False, **kwargs) -> bool:  # returns True if loading succeeds
+    def load(self, config: Optional["ExperimentCfg"]=None, net: Optional["Transformer"]=None, map_location=None, 
+             update_model_save_path=False, **kwargs) -> bool:  # returns True if loading succeeds
         if not osp.exists(self.resume_path):  # if resume_path doesn't even exist, assume this is a fresh run
-            print("No resume file found, assuming fresh model run")
+            rprint("No resume file found, assuming fresh model run")
+            self.update_model_save_path()  # there will be nothing to load so we have to set up save path properly
             return True
-        with open(self.resume_path, "r") as f:
-            resume_info = json.load(f)
-        self.wandb_run_id = resume_info["wandb_run_id"]
-        self.model_save_path = resume_info["model_save_path"]
-        self.net.cfg.replace_in_place(**resume_info["cfg"])
+        if config is not None:
+            with open(self.resume_path, "r") as f:
+                resume_info = json.load(f)
+            self.wandb_run_id = resume_info["wandb_run_id"]
+            self.model_save_path = resume_info["model_save_path"]
+            config.replace_in_place(**resume_info["cfg"])
 
-        if map_location is None:  # if map_location is not specified, don't actually load anything
-            print("map_location not specified, skipping loading state_dicts")
+        if net is None:
+            rprint("net not included in args, skipping loading state_dicts")
             return True
         
         if not osp.exists(self.model_save_path):
-            print("No existing model found", self.model_save_path)
+            rprint("No existing model found", self.model_save_path)
             return False
         
-        print("Found path of", self.model_save_path)
+        rprint("Found path of", self.model_save_path, "loading to", map_location)
         load_dict = torch.load(self.model_save_path, map_location=map_location)  # load onto cpu so sharded models don't OOM
         rprint("saved model keys", load_dict["model"].keys())
         rprint("keys", load_dict.keys())
         rprint("is loading to", map_location)
         # rprint("has num_params", len(kwargs["optim"].param_groups[0]["params"]))
 
-        if self.net.dset_cfg.vocab_size != load_dict["dset_cfg"].vocab_size:  # since we expanded vocab size halfway through,
-            new_size = self.net.dset_cfg.vocab_size  # add some dummy entries to the saved weights (we don't use those tokens
+        if net.dset_cfg.vocab_size != load_dict["dset_cfg"].vocab_size:  # since we expanded vocab size halfway through,
+            new_size = net.dset_cfg.vocab_size  # add some dummy entries to the saved weights (we don't use those tokens
             old_size = load_dict["dset_cfg"].vocab_size  # anyway, its just for efficiency reasons)
             load_dict['model']['embed.weight'] = add_rows(load_dict['model']['embed.weight'], new_size-old_size, map_location)
             load_dict['model']['unembed.weight'] = add_rows(load_dict['model']['unembed.weight'], new_size-old_size, map_location)
@@ -124,14 +128,14 @@ class Resumer():
                                                                             new_size-old_size, map_location)
             load_dict['dset_cfg'].vocab_size = new_size
 
-        self.net.dset_cfg = load_dict["dset_cfg"]  # correctly initialized already
-        self.net.best_loss = load_dict["best_loss"]
+        net.dset_cfg = load_dict["dset_cfg"]  # correctly initialized already
+        net.best_loss = load_dict["best_loss"]
 
         # there should probably just be a thing that just regenerates all buffers based on the new cfg, rather than loading them in
         if "shift_indices" in load_dict["model"]:  # adjust for if the batch size changed
-            load_dict["model"]["shift_indices"] = get_rel_bias_indices(self.net.cfg.block_size,
-                                                                       self.net.cfg.rel_bias_max_posn,
-                                                                       self.net.cfg.rel_bias_num_buckets)
+            load_dict["model"]["shift_indices"] = get_rel_bias_indices(net.cfg.block_size,
+                                                                       net.cfg.rel_bias_max_posn,
+                                                                       net.cfg.rel_bias_num_buckets)
         # actually start loading state dicts
         for k,obj in kwargs.items():  # load optimizer, scheduler, scaler state dicts
             if k == "optim":
@@ -139,8 +143,8 @@ class Resumer():
                 rprint(len(obj.param_groups[0]["params"]), type(obj.param_groups[0]["params"][0]), len(load_dict[k]["param_groups"][0]["params"]))
                 # rprint([(i, t["exp_avg"].shape) for i, t in enumerate(load_dict[k]["state"].values())])
             obj.load_state_dict(load_dict[k])
-        self.net.load_state_dict(load_dict["model"])
-
+        net.load_state_dict(load_dict["model"])
+        
         if update_model_save_path:  # 1. load model based on value in resume file (potentially old /checkpoint/* dir)
             self.update_model_save_path()  # 2. subsequent saves of the model should be to /checkpoint/curr_job_id/self.name
         return True

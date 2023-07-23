@@ -8,6 +8,7 @@ import torch._dynamo
 import socket
 import datasets as hf
 hf.disable_caching()
+import logging
 # import torch._functorch
 
 # import transformers
@@ -22,8 +23,8 @@ from transforming import net_utils
 torch.backends.cuda.matmul.allow_tf32 = True # type: ignore
 torch.backends.cudnn.allow_tf32 = True # type: ignore
 #torch._functorch.config.functionalize_rng_ops=True # type: ignore
-# torch._dynamo.config.verbose = True # type: ignore
-# torch._dynamo.config.log_level = logging.INFO # type: ignore
+torch._dynamo.config.verbose = True # type: ignore
+torch._dynamo.config.log_level = logging.INFO # type: ignore
 
 def main(local_rank, args):
     if local_rank is not None:
@@ -38,17 +39,19 @@ def main(local_rank, args):
     rprint("hi from proc, world size is", utils.get_world_size(), torch.cuda.device_count())
     for v in ["NCCL_ALGO", "NCCL_PROTO", "NCCL_BUFFSIZE", "NCCL_SOCKET_NTHREADS", "NCCL_NSOCKS_PERTHREAD"]:
         print(v, os.environ.get(v, "not found"))
-    exp_config = ExperimentCfg(vec_size=1024,
-                            n_layer=26,
+    exp_config = ExperimentCfg(vec_size=1536,
+                            n_layer=16,
                             n_heads=16,
                             lr_max=2e-4,
                             lr_min=1e-7,
+                            weight_decay=1e-2,
+                            optimizer_type="AdamW",
                             t_decay=50_000,  # there are 15B tokens roughly, so this means we iterate over the data about 1x
                             total_steps=50_000,  # since our model uses ~500M parameters, this is the right-ish amount
                             block_size=2624,  # 41*64
                             batch_size=1,
                             grad_accum_steps=144,  # 2*48
-                            train_steps=550, # num macro batches, need to make this small for pre-emption purposes
+                            train_steps=650, # num macro batches, need to make this small for pre-emption purposes
                             num_eval=300,  # num micro batches
                             dtype="float16",
                             compile=True,

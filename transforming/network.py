@@ -372,14 +372,26 @@ class Transformer(nn.Module):
         return [encoder.decode(sent.detach().cpu().numpy()) for sent in finished_sentences]
 
 
-    def get_optim(self): # optim, sched, scaler, autocast context
-        # set initial LR to 1 so that the LinearLR/warmup stage works better
-        if self.cfg.zero and self.cfg.ddp:
-            optim = ZeroRedundancyOptimizer(self.parameters(),
-                                            optimizer_class=torch.optim.Adam,
-                                            lr=self.cfg.lr_max, weight_decay=self.cfg.weight_decay)
+    def get_optim(self): # optim, sched, scaler
+        if self.cfg.weight_decay > 0:
+            grad_params = [p for p in self.parameters() if p.requires_grad]
+            weight_decay_params = [p for p in grad_params if p.dim() >= 2]  # matrices should be weight decayed
+            non_decay_params = [p for p in grad_params if p.dim() < 2]  # biases and Normalizer scalings should not be
+            param_groups = [{"params": weight_decay_params, "weight_decay": self.cfg.weight_decay},
+                            {"params": non_decay_params, "weight_decay": 0}]
         else:
-            optim = torch.optim.Adam(self.parameters(), weight_decay=self.cfg.weight_decay, lr=self.cfg.lr_max)
+            param_groups = self.parameters()  # to account for the old optimizer state dicts
+        
+        maybe_fused = dict(fused=True) if utils.get_device_type() == "cuda" else dict()
+
+        if self.cfg.zero and self.cfg.ddp:
+            optim = ZeroRedundancyOptimizer(param_groups,
+                                            optimizer_class=getattr(torch.optim, self.cfg.optimizer_type),
+                                            lr=self.cfg.lr_max,
+                                            **maybe_fused)
+        else:
+            optim = getattr(torch.optim, self.cfg.optimizer_type)(param_groups, lr=self.cfg.lr_max, **maybe_fused)
+        
         warmup_sched = LinearLR(optim, start_factor=self.cfg.lr_min/self.cfg.lr_max,
                                 end_factor=1., total_iters=self.cfg.t_warmup)
         # t_decay - t_warmup since we include the first t_warmup iters in the "decay" period
