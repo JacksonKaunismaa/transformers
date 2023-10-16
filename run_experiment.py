@@ -44,7 +44,7 @@ def main(local_rank, args):
                             n_heads=16,
                             lr_max=2e-4,
                             lr_min=1e-7,
-                            weight_decay=1e-2,
+                            weight_decay=3e-3,
                             optimizer_type="AdamW",
                             t_decay=50_000,  # there are 15B tokens roughly, so this means we iterate over the data about 1x
                             total_steps=50_000,  # since our model uses ~500M parameters, this is the right-ish amount

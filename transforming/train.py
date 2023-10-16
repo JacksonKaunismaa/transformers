@@ -57,6 +57,7 @@ def run_experiment(dsets, proj_name, resume_path, exp_config: ExperimentCfg, sam
         net = DDP(net, device_ids=[device_id], output_device=device_id)
     
 
+
         # [print(utils.get_local_rank(), torch.cuda.memory_summary(n)) for n in range(torch.cuda.device_count())]
 
     # with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
@@ -80,9 +81,12 @@ def run_experiment(dsets, proj_name, resume_path, exp_config: ExperimentCfg, sam
         if not load_success:
             print("Attempted to load from checkpoint, but failed, aborting")
             return
+        for gr in optim.param_groups:  # if the config loaded from the resume file changes the weight decay, update it
+            if gr['weight_decay'] > 0:
+                gr['weight_decay'] = exp_config.weight_decay
     # #rprint("setting device to", exp_config.device, net.cfg.device)
 
-        
+    rprint("weight decays", [gr['weight_decay'] for gr in optim.param_groups if 'weight_decay' in gr])
     if utils.get_rank() == 0:
         print("Config is:", exp_config)
 
@@ -132,52 +136,52 @@ def train(net, resumer, scaler, scheduler, optimizer, exp_config: ExperimentCfg,
 
     while (curr_iter := scheduler.last_epoch) < exp_config.total_steps:
         start = utils.get_time()
-        rprint("starting time", start, "mem alloc", torch.cuda.memory_summary())
+        # rprint("after starting time", start, "mem alloc", torch.cuda.memory_summary())
         for s in trange(exp_config.train_steps):
 
             for i in range(grad_accum_steps):  # compute gradients for a single macro-batch
                 sample = next(tr_loader)  # TODO: maybe move getting the next sample to after the forward pass, to overlap better
-                if s == 0 and i == 0:
-                    rprint("after next(tr_loader)", torch.cuda.memory_summary())
+                # if s == 0 and i == 0:
+                #     rprint("after next(tr_loader)", torch.cuda.memory_summary())
                 if isinstance(sample, dict):  # handle commavq dataset
                     sample = sample['xy'].transpose(0,1)  # switch batch and x vs. y dimension
-                if s == 0 and i == 0:
-                    rprint("after sample[xy].transpose", torch.cuda.memory_summary()) 
+                # if s == 0 and i == 0:
+                #     rprint("after sample[xy].transpose", torch.cuda.memory_summary()) 
                 x,y = [el.to(net.device, non_blocking=True) for el in sample]
-                if s == 0 and i == 0:
-                    rprint("after x,y.cuda", torch.cuda.memory_summary())
+                # if s == 0 and i == 0:
+                #     rprint("after x,y.cuda", torch.cuda.memory_summary())
                 if exp_config.ddp:   # only bother doing sync when doing the very last .backward() before an optimizer step
                     net.require_backward_grad_sync = ((i+1) % grad_accum_steps == 0)
                 batch_loss = net(x, y)[1] / grad_accum_steps  # net returns (loss_value, logits) tuple
-                if s == 0 and i == 0:
-                    rprint("after net(x,y)", torch.cuda.memory_summary())
+                # if s == 0 and i == 0:
+                #     rprint("after net(x,y)", torch.cuda.memory_summary())
                 scaler.scale(batch_loss).backward()  # accumulate scaled gradients
-                if s == 0 and i == 0:
-                    rprint("after .backward(loss)", torch.cuda.memory_summary())
+                # if s == 0 and i == 0:
+                #     rprint("after .backward(loss)", torch.cuda.memory_summary())
 
             scaler.unscale_(optimizer)  # unscale so that we can clip propely
-            if s == 0:
-                rprint("after scale.unscale(optim)", torch.cuda.memory_summary())
+            # if s == 0:
+            #     rprint("after scale.unscale(optim)", torch.cuda.memory_summary())
             torch.nn.utils.clip_grad_norm_(net.parameters(), exp_config.grad_clip)  # type: ignore
-            if s == 0:
-                rprint("after clip grad", torch.cuda.memory_summary())
+            # if s == 0:
+            #     rprint("after clip grad", torch.cuda.memory_summary())
             scaler.step(optimizer)  # already gradients are unscaled (as they should be), this won't double unscale them
-            if s == 0:
-                rprint("after scaler.step", torch.cuda.memory_summary())
+            # if s == 0:
+            #     rprint("after scaler.step", torch.cuda.memory_summary())
             scaler.update()  # update scale parameter
-            if s == 0:
-                rprint("after scaler.update", torch.cuda.memory_summary())
+            # if s == 0:
+            #     rprint("after scaler.update", torch.cuda.memory_summary())
             optimizer.zero_grad(set_to_none=True)  # supposedly better on memory
-            if s == 0:
-                rprint("after optim.zero_grad", torch.cuda.memory_summary())
+            # if s == 0:
+            #     rprint("after optim.zero_grad", torch.cuda.memory_summary())
             scheduler.step()  # update LR
-            if s == 0:
-                rprint("after scheduler.step", torch.cuda.memory_summary())
+            # if s == 0:
+            #     rprint("after scheduler.step", torch.cuda.memory_summary())
 
         epoch_time = utils.get_time() - start
-        rprint("after utils.get_time", torch.cuda.memory_summary())
+        # rprint("after utils.get_time", torch.cuda.memory_summary())
         metrics.evaluate(net, dsets, exp_config, all_metrics)
-        rprint("after .evaluate", torch.cuda.memory_summary())
+        # rprint("after .evaluate", torch.cuda.memory_summary())
         curr_iter = scheduler.last_epoch
         short_name_metrics = {f"{split[:2]}_{metric_name[:4]}": result[-1]  # shorten names of metrics for pretty printing
                               for metric_name,results in all_metrics.items()  # read as an nested for-loop with the
@@ -193,7 +197,7 @@ def train(net, resumer, scaler, scheduler, optimizer, exp_config: ExperimentCfg,
                            "step": curr_iter
                         })
             print(epoch_summary)
-        rprint("after wandb.log", torch.cuda.memory_summary())
+        # rprint("after wandb.log", torch.cuda.memory_summary())
         rprint("checking whether to save, best was", non_ddp_net.best_loss, "last loss was", all_metrics["loss"]["eval"][-1])
         if all_metrics["loss"]["eval"][-1] < non_ddp_net.best_loss or np.isnan(all_metrics["loss"]["eval"][-1]):  
             non_ddp_net.best_loss = all_metrics["loss"]["eval"][-1]
@@ -201,7 +205,7 @@ def train(net, resumer, scaler, scheduler, optimizer, exp_config: ExperimentCfg,
             # if utils.get_rank() == 0:  # put rank check here so that all ranks have consistent .best_loss
             # need to disable the rank check here since sharded optimizer requires all ranks to consolidate
             resumer.save(net=non_ddp_net, scaler=scaler, optim=optimizer, sched=scheduler)
-            rprint("after .save", torch.cuda.memory_summary())
+            # rprint("after .save", torch.cuda.memory_summary())
 
             # non_ddp_net.save_model_state_dict(scaler=scaler, optim=optimizer, sched=scheduler)
             # ie. save the nan model, but stop training

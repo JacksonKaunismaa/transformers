@@ -33,28 +33,28 @@ def evaluate(net, dsets, exp_config, all_metrics):
                          for split in dsets} 
                      for k in all_metrics}
     
-    oprint("starting evaluation at", utils.get_time(), "mem", torch.cuda.memory_summary())
+    oprint("after starting evaluation at", utils.get_time())#, "mem", torch.cuda.memory_summary())
 
     for split in dsets:
         # print("starting split", split, utils.get_rank(), utils.get_time())
         for i, sample in tqdm(enumerate(dsets[split].dataloader())):
             if i >= exp_config.num_eval:  # so that we don't iterate over the entire training set while estimating tr_loss
                 break
-            if i <= 1:
-                rprint("started", torch.cuda.memory_summary(), i)
+            # if i <= 1:
+            #     rprint("after sampling first", torch.cuda.memory_summary(), i)
             if isinstance(sample, dict):  # handle commavq dataset
                 sample = sample['xy'].transpose(0,1)
-            if i <= 1:
-                rprint("sample.transpose", torch.cuda.memory_summary(), i)
+            # if i <= 1:
+            #     rprint("after sample.transpose", torch.cuda.memory_summary(), i)
             # print("started iterating", split)
             # print(sample)
             x,y = [el.to(net.device, non_blocking=True) for el in sample]
-            if i <= 1:
-                rprint("xy.cuda", torch.cuda.memory_summary(), i)
+            # if i <= 1:
+            #     rprint("after xy.cuda", torch.cuda.memory_summary(), i)
             # print("transferred sample")
             logits, loss = net(x, y)  # match nanoGPT order of return
-            if i <= 1:
-                rprint("net(x,y)", torch.cuda.memory_summary(), i)
+            # if i <= 1:
+            #     rprint("after net(x,y)", torch.cuda.memory_summary(), i)
             # calculate supported metrics
             for metric_name in epoch_metrics:
                 if metric_name == "loss":  # calculate the metrics that are requested
@@ -66,8 +66,8 @@ def evaluate(net, dsets, exp_config, all_metrics):
                 else:
                     raise ValueError(f"Metric name {metric_name} is not supported.")
                 epoch_metrics[metric_name][split][i] = metric_result
-            if i <= 1:
-                rprint("after full eval iter", torch.cuda.memory_summary(), i)
+            # if i <= 1:
+            #     rprint("after full eval iter", torch.cuda.memory_summary(), i)
         # print("on split", split, 'rank', utils.get_rank(), "has loss", epoch_metrics["loss"][split], utils.get_time())
         if exp_config.ddp:
             for metric_name in epoch_metrics.keys():  # do this since you shouldn't iterate over a thing you are modifying
