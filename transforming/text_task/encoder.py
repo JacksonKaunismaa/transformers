@@ -31,6 +31,7 @@ def create_byte_mapper():
     return dict(zip(byte_list, byte_reprs))
 
 def download_remote(url, fname):
+    """Download a file from a remote location `url` to `fname` if `fname` doesn't already exist."""
     if not osp.exists(fname):
         response = requests.get(url)
         with open(fname, "wb") as f:
@@ -38,6 +39,7 @@ def download_remote(url, fname):
 
 
 def batch_data(data, n): # itertools recipe
+    """Split an iterable into batches of size n. The last batch may be smaller than n."""
     # batched('ABCDEFG', 3) --> ABC DEF G
     if n < 1:
         raise ValueError('n must be at least one')
@@ -68,19 +70,25 @@ class Encoder():  # or should it be called tokenizer
         self.cache = {} # cache
 
     def get_bigrams(self, token):  # token in the sense of "something having come from self.pat" + merging steps
+        """Get list of bigrams in a sequence of tokens. 
+        eg. ['h', 'e', 'l', 'l', 'o'] -> [("h", "e"), ("e", "l"), ("l", "l"), ("l", "o")]"""
         return set(zip(token, token[1:]))
 
     def bpe_merge(self, token):
+        """Merge a single token, which we split into many characters, into a list of bpe tokens.
+        Args:
+            token (str): A token to merge.
+        Returns:
+            List[str]: A list of bpe tokens."""
         if token in self.cache:  # check cache first
             return self.cache[token]
 
-        curr_token = list(token)  # we only do the string->list thing so the cache works
+        # (eg. 'discombobulated' -> ['d', 'i', 's', 'c', 'o', 'm', 'b', 'o', 'b', 'u', 'l', 'a', 't', 'e', 'd'])
+        curr_token = list(token)  # we only do the string->list thing so the cache works 
 
         while len(curr_token) > 1:  # if it's merged to a single token, we are done anyway
-            bigrams = self.get_bigrams(curr_token)
-            # print("\t", bigrams, token, "bigr", "tok")
+            bigrams = self.get_bigrams(curr_token)  # keep merging until we can't merge anymore
             next_merge = min(bigrams, key=lambda bg: self.bpe_merge_order.get(bg, float("inf")))
-            # print("\tdecided to merge", next_merge)
             if next_merge in self.bpe_merge_order:  # ie. there is a valid merge still left to do
                 merged_word = []
                 bigram_token_iter = zip(curr_token, curr_token[1:])
@@ -105,25 +113,29 @@ class Encoder():  # or should it be called tokenizer
         self.cache[token] = curr_token
         return curr_token
 
-    def encode(self, text: str):
+    def encode(self, text: str) -> List[int]:
+        """Encode a string into a list of token indices.
+        Args:
+            text (str): The string to encode.
+        Returns:
+            List[int]: A list of token indices."""
         try:
             tokens = re.findall(self.pat, text)
         except TypeError:
             print(text[:min(300, len(text))])
             raise
         idx_list = []
-        for tok in tokens:
-            unicode_tok = tok.encode("utf-8")
-            pretty_tok = "".join(self.byte_encoder[b] for b in unicode_tok)  # string format for the cache
-            # print(pretty_tok, "pretty")
-            bpe_tok = self.bpe_merge(pretty_tok)
-            # print(bpe_tok, "bpe merged")
+        for tok in tokens:  # for each token in the sentence (eg.  'discombobulated')
+            unicode_tok = tok.encode("utf-8")  # into string of bytes  (eg. b'discombobulated')
+            pretty_tok = "".join(self.byte_encoder[b] for b in unicode_tok)  # mapped bytes string (eg. 'discombobulated')
+            bpe_tok = self.bpe_merge(pretty_tok)  # merge the bytes into bpe tokens (eg. ['dis', 'comb', 'ob', 'ulated'])
 
-            idx_tok = [self.tok_to_idx[t] for t in bpe_tok]
+            idx_tok = [self.tok_to_idx[t] for t in bpe_tok]  # turn BPE token strings into BPE indices
             idx_list += idx_tok
         return idx_list
 
     def process_one(self, text: str):
+        """For multiprocessing, encode a single text string and append the EOS token. Return the encoded text and its length."""
         enc_tokens = self.encode(text)
         enc_tokens.append(self.eos_token)
         return np.asarray(enc_tokens, dtype=np.uint16), len(enc_tokens)
@@ -132,6 +144,14 @@ class Encoder():  # or should it be called tokenizer
         return tok_arr.shape[0]
 
     def encode_file_list(self, data_dir, subdir, out_fname, nproc):
+        """Encode all files in a directory into a single file, using nproc processes.
+        Args:
+            data_dir (str): The directory containing the files to encode.
+            subdir (str): The subdirectory containing the files to encode. We search data_dir/subdir for any files.
+            out_fname (str): The name of the output file.
+            nproc (int): The number of processes to use.
+        Returns:
+            int: The total size of the encoded file. Also writes the encoded text to `out_fname`."""
         all_lines = []
         in_fnames = glob.glob(osp.join(data_dir, subdir, "*"))
         np.random.shuffle(in_fnames)
@@ -152,6 +172,13 @@ class Encoder():  # or should it be called tokenizer
 
 
     def write_file(self, out_fname, enc_lines, total_size):
+        """Write the encoded lines to a file in groups of 1024 bytes.
+        Args:
+            out_fname (str): The name of the output file.
+            enc_lines (List[np.ndarray]): A list of encoded lines.
+            total_size (int): The total size of the encoded file.
+        Returns:
+            None, but writes the encoded text to `out_fname`."""
         print("Preparing to write", total_size, "values to", out_fname)
         out_f = np.memmap(out_fname, dtype=enc_lines[0].dtype, mode="w+", shape=(total_size,))
         idx = 0
@@ -163,6 +190,12 @@ class Encoder():  # or should it be called tokenizer
         #return size
 
     def decode(self, idx_list: List[int], split=False):
+        """Decode a list of token indices into a string.
+        Args:
+            idx_list (List[int]): A list of token indices.
+            split (bool): If True, return a list of string tokens instead of a single string.
+        Returns:
+            Union[str, List[str]]: The decoded string or list of token strings."""
         # if tok is not in idx_to_tok its probably a control token like PAD or STOP or something else, so ignore it
         tokens = [self.idx_to_tok[idx] for idx in idx_list if idx in self.idx_to_tok]
         text = []

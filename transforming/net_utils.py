@@ -20,6 +20,8 @@ if TYPE_CHECKING:
 
 class Resumer():
     def __init__(self, resume_path: str, job_id: int, model_ckpt_dir="/checkpoint/jackk"):
+        """Framework for easily saving model configuration, model weights, optimizer state, and wandb run, so that
+        a given training run can be resumed if it crashes, or if you want to change hyperparameters."""
         self.resume_path = resume_path
         self.model_ckpt_dir = model_ckpt_dir
 
@@ -27,22 +29,24 @@ class Resumer():
         self.model_save_path = ""
         self.job_id = job_id
 
-        # if osp.exists(resume_path):
-        #     existing_paths = glob.glob(osp.join(resume_path, "*"))
-        #     nums = [int(path.split(".")[-1]) for path in existing_paths] + [0]  # add [0] so there is always at least 1 element
-        #     next_num = max(nums) + 1
-        #     self.resume_path = f"{resume_path}.{next_num}"
-        #     rprint("Warning: Creating new resume file since you specified an already existing resume path, but resume=False")
-        #     rprint("New path is: ", self.resume_path)
-
         self.name = osp.basename(self.resume_path)
         rprint("Model name is", self.name)
 
     def update_model_save_path(self):
+        """Set model save path to be base_directory/job_id"""
         self.model_save_path = osp.join(self.model_ckpt_dir, str(self.job_id), self.name)
         rprint("Updated save path to", self.model_save_path)
 
-    def save(self, net: "Transformer", optim=None, **kwargs):  # kwargs should contain optimizer,scheduler, and scaler        
+    def save(self, net: "Transformer", optim=None, **kwargs):  # kwargs should contain optimizer,scheduler, and scaler    
+        """Save model parameters to the path specified by self.model_save_path. Scheduler state, scaler, and other
+        arbitrary state_dict() based Pytorch objects will be additionally saved if they are passed in for `kwargs`. Optimizer state, 
+         including support for ZeRO sharded optimizers, will be saved if passed in for `optim`. Generates a 
+        checkpoint file that also includes model configuration, dataset configuration, and best_loss value.
+        Args:
+            net (Transformer): the model to save
+            optim (torch.optim.Optimizer or torch.distributed.optim.DistributedOptimizer): the optimizer to save
+            kwargs (dict): dictionary of other state_dict() based Pytorch objects to save
+        """    
         # save state_dicts
         oprint(f"starting saving, {net.best_loss=}")
         save_dict = {"model": net.state_dict(),
@@ -51,20 +55,9 @@ class Resumer():
                      "best_loss": net.best_loss}
 
         if net.cfg.ddp and net.cfg.zero and optim is not None:  # sharded optimizer => need to collate before saving
-            rprint("is consolidating")
-            # rprint("Has state", optim.state.keys())
-            rprint("pre consolidate, has num_params", len(optim.param_groups[0]["params"]))
             optim.consolidate_state_dict()
-            rprint("post consolidate, rank, has num_params", len(optim.param_groups[0]["params"]))
 
             if utils.get_rank() == 0:
-                # rprint("is saving", optim.state_dict().keys())
-                rprint("saving num_params", len(optim.state_dict()["param_groups"][0]["params"]))
-                try:
-                    rprint("state_dict device is", optim.state_dict()["state"][0]["exp_avg"].device)
-                except KeyError as e:
-                    rprint("error happened on getting device of state dict", e)
-                    rprint("state_dict keys are", optim.state_dict()["state"].keys())
                 save_dict["optim"] = optim.state_dict()  # it transfers shards to CPU first, so GPU mem is fine
             rprint("done consolidating")
         elif optim is not None:
@@ -74,11 +67,11 @@ class Resumer():
             save_dict[k] = obj.state_dict()
 
         if utils.get_rank() == 0: # only do the actual IO if rank == 0
-            rprint("saving being done")
+            rprint("writing dicts...")
             torch.save(save_dict, self.model_save_path)  # type: ignore 
 
         if utils.get_rank() == 0:   # update resume file, only actually create this file once the model_state dict is saved
-            with open(self.resume_path, "w") as f:
+            with open(self.resume_path, "w") as f:  # contains metadata info about the run
                 resume_info = dict(wandb_run_id=self.wandb_run_id,
                                    cfg=dataclasses.asdict(net.cfg),
                                    model_save_path=self.model_save_path)
@@ -88,10 +81,25 @@ class Resumer():
 
     def load(self, config: Optional["ExperimentCfg"]=None, net: Optional["Transformer"]=None, map_location=None, 
              update_model_save_path=False, **kwargs) -> bool:  # returns True if loading succeeds
+        """Load in model, optimizer state, scheduler state, scaler state, model configuration, and wandb run id from a given resume file.
+        `config` is updated in place to exactly match the config saved in the resume file, if one exists. The `exp_config` inside the 
+        `net` object is also updated to reflect the resume file. 
+        if `net` is set to None, all loading except for `config` based loading is skipped.
+        Args:
+            config (ExperimentCfg): the config object to update in place
+            net (Transformer): the model to load state dicts onto
+            map_location (torch.device or str): where to load the model onto
+            update_model_save_path (bool): whether to update the model save path to the current job_id or to use the old job_id in the resume file
+            kwargs (dict): dictionary of other Pytorch objects to load state dicts onto
+        Returns:
+            bool: whether the loading was successful
+        """
+        
         if not osp.exists(self.resume_path):  # if resume_path doesn't even exist, assume this is a fresh run
             rprint("No resume file found, assuming fresh model run")
             self.update_model_save_path()  # there will be nothing to load so we have to set up save path properly
             return True
+        
         if config is not None:
             with open(self.resume_path, "r") as f:
                 resume_info = json.load(f)
@@ -109,18 +117,16 @@ class Resumer():
         
         rprint("Found path of", self.model_save_path, "loading to", map_location)
         load_dict = torch.load(self.model_save_path, map_location=map_location)  # load onto cpu so sharded models don't OOM
-        rprint("saved model keys", load_dict["model"].keys())
-        rprint("keys", load_dict.keys())
-        rprint("is loading to", map_location)
-        # rprint("has num_params", len(kwargs["optim"].param_groups[0]["params"]))
 
+
+        # converting old model formats to new model formats, if necessary
         if net.dset_cfg.vocab_size != load_dict["dset_cfg"].vocab_size:  # since we expanded vocab size halfway through,
             new_size = net.dset_cfg.vocab_size  # add some dummy entries to the saved weights (we don't use those tokens
             old_size = load_dict["dset_cfg"].vocab_size  # anyway, its just for efficiency reasons)
             load_dict['model']['embed.weight'] = add_rows(load_dict['model']['embed.weight'], new_size-old_size, map_location)
             load_dict['model']['unembed.weight'] = add_rows(load_dict['model']['unembed.weight'], new_size-old_size, map_location)
                                                        
-            for k in load_dict['optim']['state']:
+            for k in load_dict['optim']['state']:  # convert old optimizer state to new optimizer state
                 if old_size in load_dict['optim']['state'][k]['exp_avg'].shape:  # unsafe to assume this, but not much else to go on
                     load_dict['optim']['state'][k]['exp_avg'] = add_rows(load_dict['optim']['state'][k]['exp_avg'], 
                                                                          new_size-old_size, map_location)
@@ -138,13 +144,10 @@ class Resumer():
                                                                        net.cfg.rel_bias_num_buckets)
         # actually start loading state dicts
         for k,obj in kwargs.items():  # load optimizer, scheduler, scaler state dicts
-            if k == "optim":
-                # rprint([(i, t.shape) if hasattr(t, "shape") else (i, t, type(t)) for i, t in enumerate(obj.param_groups[0]["params"])])
-                rprint(len(obj.param_groups[0]["params"]), type(obj.param_groups[0]["params"][0]), len(load_dict[k]["param_groups"][0]["params"]))
-                # rprint([(i, t["exp_avg"].shape) for i, t in enumerate(load_dict[k]["state"].values())])
             obj.load_state_dict(load_dict[k])
         net.load_state_dict(load_dict["model"])
         
+                                    # typical usage looks like this:
         if update_model_save_path:  # 1. load model based on value in resume file (potentially old /checkpoint/* dir)
             self.update_model_save_path()  # 2. subsequent saves of the model should be to /checkpoint/curr_job_id/self.name
         return True
@@ -153,10 +156,12 @@ class Resumer():
 
 
 def add_rows(tensor, num_rows, device):
+    """Append dummy rows of ones to the bottom of a tensor, to increase the number of rows in the tensor."""
     return torch.cat([tensor, torch.ones(num_rows, tensor.shape[1], device=device)])
 
 
 def sinusoid_matrix(seq_len, vec_size):  # for position embeddings
+    """Generates a sinusoidal positional embedding matrix of size (seq_len, vec_size) for a transformer model."""
     posn = torch.zeros(seq_len, vec_size)
     pow_arr = torch.pow(10_000, -torch.arange(0,vec_size,2)/vec_size)
     seq_arr = torch.arange(seq_len)
@@ -169,13 +174,24 @@ def sinusoid_matrix(seq_len, vec_size):  # for position embeddings
 
 
 # RELATIVE
-def get_index_shifter(seq_len, batch_size, n_head):  # for relative position embeddings
+def get_index_shifter(seq_len, batch_size, n_head):  # for relative position embeddings https://arxiv.org/pdf/1901.02860v3
+    """Outputs indices that can be used with torch.take for use with relative position embeddings. Enables 50% speedup
+    when operating on full block size as compared to indexing into the matrix. (For terms b) and d) in the paper). We
+    need all the weird .remainder stuff because .take expects indices as if the tensor were 1D
+    Args:
+        seq_len (int): the length of the sequence
+        batch_size (int): the size of the batch
+        n_head (int): the number of heads in the model
+    Returns:
+        torch.Tensor: a tensor of indices of shape (batch_size, n_head, seq_len, seq_len)"""
     return torch.remainder((torch.arange(seq_len)*-1)[:,None] + torch.arange(seq_len) - 1, seq_len) + \
         seq_len*torch.arange(seq_len)[:,None] + (torch.arange(n_head)*(seq_len**2))[:,None,None] + \
         (torch.arange(batch_size)*(n_head*seq_len**2))[:,None,None,None]
 
 
 def get_variable_index_shifter(seq_len, device):  # could use a cache here to save a bit of speed, but might cause OOM on train
+    """Alternative, slower way to do the proper indexing for relative position embeddings. Index your seq_len dimensions
+    with row_idx, col_idx. (For terms b) and d) in the paper"""
     col_idx = torch.remainder((torch.arange(seq_len, device=device)*-1)[:,None] + torch.arange(seq_len, device=device) - 1, seq_len)
     row_idx = torch.arange(seq_len, device=device)[:,None]
     return row_idx, col_idx

@@ -11,24 +11,15 @@ from . import encoder
 from .. import utils
 
 
-# class InfiniteSampler(Sampler):
-#     def __init__(self, dset_size):
-#         self.dset_size = dset_size
-
-#     def __iter__(self):
-#         while True:
-#             yield from itertools.islice(torch.randperm(self.dset_size), 0, None)
-
 def make_infinite(dataloader):
     while True:
         yield from dataloader
 
 
 class IdxDataset(Dataset):  # this feels like it shouldn't work... (has to learn to ignore all context before EOS)
+    """Concatenate all sentences in the dataset into one long sequence, and then sample from it. Sentences are separated by EOS tokens.
+    This implementation will use np.memmap to map the index dataset, which comes from the output of build_dataset, into memory."""
     def __init__(self, fname, exp_cfg: ExperimentCfg, dset_cfg: DatasetCfg):
-        # with open(osp.join(dset_cfg.dataset_path, "sizes.pkl"), "rb") as p:
-        #     size_dict = pickle.load(p)
-        #     data_size = size_dict[fname]
         self.data = np.memmap(osp.join(dset_cfg.dataset_path, fname), dtype=np.uint16, mode="r")#, shape=(data_size,))
         self.encoder = encoder.get_encoder(dset_cfg.dataset_path)
 
@@ -39,7 +30,7 @@ class IdxDataset(Dataset):  # this feels like it shouldn't work... (has to learn
         self.cfg.total_size = self.data.shape[0]
         
     def __len__(self):
-        # return 5
+        # return 5  # toggle this for a testing/debugging run
         return (self.cfg.total_size - self.exp_cfg.block_size - 1) // self.cfg.chunk_size
     
     def dataloader(self, num_workers=1):
@@ -56,18 +47,24 @@ class IdxDataset(Dataset):  # this feels like it shouldn't work... (has to learn
     def __getitem__(self, idx):
         if torch.is_tensor(idx):
             idx = idx.tolist()
-        #print(f"rank {utils.get_rank()} accessed idx {idx}")
-        # print(idx, type(idx))
+
         data_idx = idx * self.cfg.chunk_size  
         # due to the way len is defined, this shouldnt hit any IndexErrors
         x = torch.from_numpy(self.data[data_idx : data_idx+self.exp_cfg.block_size].astype(np.int32))  # minor space save
         y = torch.from_numpy(self.data[data_idx+1 : data_idx+self.exp_cfg.block_size+1].astype(np.int64))
-        # position indices, assuming that x[0] is position 0, resetting any time we hit an EOS
-        # seems like you could also store the actual positions in the dataset, and have it not start x[0] being at posn 0
-        #posn = 
         return x, y
     
 def build_dataset(data_dir):  # helper function that should probably be moved into a script somewhere
+    """Map a dataset of text files into a single long sequence of indices.
+    This function will create two .bin files in the data_dir, one for training and one for evaluation.
+    Inside of data_dir, it searches for two subdirectories, "training-monolingual.tokenized.shuffled" and 
+    "heldout-monolingual.tokenized.shuffled", which contain the text files to be encoded. 
+    Args:
+        data_dir (str): A directory containing 2 subdirectories, "training-monolingual.tokenized.shuffled" and 
+                        "heldout-monolingual.tokenized.shuffled", each of which contain text files.
+    Returns:
+        None, but writes two .bin files to data_dir.
+    """
     import pickle
     from .encoder import get_encoder
     # create idx dataset .bin files if not already created

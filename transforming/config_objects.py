@@ -10,10 +10,10 @@ class ExperimentCfg:
     vec_size: int = 1536
     n_heads: int = 12
     n_layer: int = 12
-    layer_norm_posn: str = "weird"
+    layer_norm_posn: str = "weird"   # must be pre, post, or weird (see network.py:TransformerBlock.forward)
     block_size: int = 2048
     flash: bool = True  # whether to use Flash attention or not
-    mqa_attn: bool = False  # whether to use multi query attention or not
+    mqa_attn: bool = False  # whether to use multi query attention or not: https://arxiv.org/pdf/1911.02150
     dtype: str = "bfloat16"  # float32, float16, and bfloat16 are supported (for mixed precision)
     linear_bias: bool = False  # enable/disable biases for all MLP Linear layers
     learnable_unembed: bool = True  # enable/disable having the unembed matrix be seperately learnable from the embedding matrix
@@ -25,12 +25,12 @@ class ExperimentCfg:
 
     # Position embedding stuff
     posn_embed_type: str = "base"  # must be in ['base_sinusoid', 'base_learnable', 'relative', 'none', 'rel_bias', 'rotary']
-    # rel_bias
+    # rel_bias: https://arxiv.org/pdf/1910.10683
     rel_bias_max_posn: int = 128  # only has effect if posn_embed_type == "rel_bias"
     rel_bias_num_buckets: int = 32  # only has effect if posn_embed_type == "rel_bias"
-    # relative
+    # relative: https://arxiv.org/pdf/1901.02860v3
     relative_float32_attn: bool = False  # if posn_embed_type =="relative", force float32 in relative_posn attention computation
-    # rotary
+    # rotary: https://arxiv.org/pdf/2104.09864
     rotary_dim: int = 64  # if posn_embed_type=='rotary', set the max number of hidden dims to rotate
     rotary_learnable_freqs: bool = False # if posn_embed_type=='rotary', set freqs to be learnable or not
 
@@ -49,8 +49,8 @@ class ExperimentCfg:
 
     # Training params
     total_steps: int = 40_000  # set so that we see each token in the dataset 10x?
-    train_steps: int = 500  # every num_train macro-batches, do an eval (yes, i realize this definition conflicts with num_eval and is confusing)
-    num_eval: int = 500  # do at most this many micro batches to estimate losses (train and eval) at the end of an epoch
+    train_steps: int = 500  # every num_train macro-batches, do an eval
+    num_eval: int = 500  # do at most this many macro batches to estimate losses (train and eval) at the end of an epoch
     # epochs: int = 50
     grad_clip: float = 1.0
     weight_decay: float = 0
@@ -81,9 +81,6 @@ class ExperimentCfg:
         return dataclasses.replace(self, vec_size=128, n_layer=1, n_heads=4, lr_max=2e-4, lr_min=1e-7, block_size=1024, batch_size=2,
                 grad_accum_steps=16, train_steps=2, num_eval=3, dtype="float16", compile=False, zero=False, checkpointing=False,
                 normalizer_type="RMSNorm", rmsnorm_p=0.2, posn_embed_type="relative", flash=False)
-        # return dataclasses.replace(self, 
-        #         grad_accum_steps=8, train_steps=2, num_eval=3, dtype="float16", compile=False, zero=False, checkpointing=False,
-        #         normalizer_type="RMSNorm", rmsnorm_p=0.2, posn_embed_type="relative", flash=False, posn_embed_learnable=False)
     
 
 @dataclasses.dataclass
@@ -112,11 +109,16 @@ class CommaVQDatasetCfg:    # to make things easy to pass around and access/save
 
 # chunksize is how finegrained to split the dataset. sequences are sampled from the beginning of chunks,
 # each of which are chunksize in size. Also defines the len of the Dataset
-# self.chunk_size = chunk_size
-# aaaaaaaAaaaaa|bBbbbbbbbBbbb|cccCcccccccCcc|ddddDdddddddDd|eeeeeEeeeeee|FfffffffFffff|ggGgggggggggg
-# -------^-------^-------^-------^-------^-------^-------^-------^-------^-------^-------^
-#       1*c     2*c     3*c     4*c     5*c     6*c     7*c     8*c     9*c     10*c    11*c
-# batches are: aaaaaaaAaaaaa, Aaaaaa|bB, BbbbbbbbB, Bbbb|cccC, CcccccccC, 
-#              Ccc|ddddD, DdddddddD, Dd|eeeeeE, Eeeeeee|F, FfffffffF, Fffff|ggG, Ggggggggggg
-
+# if c = chunk size = 8, and | separates the dataset into sequences of tokens of length block size = 14:
+# aaaaaaaAaaaaaa|bBbbbbbbbBbbbb|cccCcccccccCcc|dddddDdddddddD|eeeeeeeEeeeeee
+# -------^--------^-------^--------^-------^--------^-------^--------^-------
+#       1*c      2*c     3*c      4*c     5*c      6*c     7*c      8*c     
+# batches are: aaaaaaaAaaaaaa, 
+#              AaaaaaabBbbbbb,
+#              BbbbbbbbBbbbbc, 
+#              BbbbbcccCccccc,
+#              CcccccccCccddd, 
+#              CccdddddDddddd,
+#              DdddddddDeeeee,
+#              DeeeeeeeEeeeee
     

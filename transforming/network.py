@@ -27,16 +27,6 @@ class MLPBlock(nn.Module):
 
     def forward(self, x):
         # x -> (batch, seq_len, vec_size)
-        # print("s0", x.norm())
-        # s1 = self.w_1(x)
-        # print("s1", s1.norm())
-        # s2 = self.act_func(s1)
-        # print("s2", s2.norm())
-        # s3 = self.w_2(s2)
-        # print("s3", s3.norm())
-        # s4 = self.dropout(s3)
-        # print("s4", s4.norm())
-        # return s4
         return self.dropout(self.w_2(self.act_func(self.w_1(x))))
 
 
@@ -78,7 +68,8 @@ class MultiHeadAttention(nn.Module):
         self.cfg = cfg
 
         # need to do this weird call to bypass nn.Module setattr checks
-        object.__setattr__(self, "main_transformer", main_transformer)  # save this so we can access the needed buffers
+        # save this so we can access the needed buffers shared between layers
+        object.__setattr__(self, "main_transformer", main_transformer) 
 
 
         if cfg.flash and cfg.posn_embed_type not in ["base_sinusoid", "base_learnable", "none", "rotary"]:
@@ -103,10 +94,8 @@ class MultiHeadAttention(nn.Module):
 
     def forward(self, x):
         # x -> (batch, seq_len, vec_size)
-        # print(x.shape)
         batch, seq_len, _ = x.shape
-        # print(x.shape)
-        # x_head = x.view(batch, seq_len, self.n_heads, self.head_size)
+        
         qkv = self.qkv(x)
         if self.cfg.mqa_attn:
             qkv = (qkv[..., :self.cfg.vec_size],   # q (batch, seq_len, vec_size)
@@ -143,6 +132,7 @@ class MultiHeadAttention(nn.Module):
                     if self.cfg.relative_float32_attn:
                         rel_posn = rel_posn.float()
 
+                    # terms b) and d) in the paper
                     # (batch, n_head, seq_len, head_size) @ (1, n_head, head_size, seq_len) -> (batch, n_head, seq_len, seq_len)
                     query_posn = (q + self.posn_vect_v) @ rel_posn
                     # if full shape, take advantage of .take speed up
@@ -158,7 +148,7 @@ class MultiHeadAttention(nn.Module):
                 rel_bias = self.main_transformer.rel_bias(self.main_transformer.rel_bias_indices[:seq_len, :seq_len]) # type:ignore
                 rel_bias = rel_bias.permute([2, 0, 1]).unsqueeze(0)
                 attn_dots = q @ k.transpose(2, 3) + rel_bias
-            else:  # ie. vanilla transformer
+            else:  # ie. vanilla transformer, assume position emebeddings were applied at the base of the model
                 # q (batch, n_heads, seq_len, head_size) @ k.T (batch, n_heads, head_size, seq_len)
                 attn_dots = q @ k.transpose(2,3)  # attn_dots is (batch, n_heads, seq_len, seq_len)
 
@@ -197,12 +187,8 @@ class TransformerBlock(nn.Module):
             x = self.ln1(x + self.mha(x))
             x = self.ln2(x + self.mlp(x))
         elif self.layer_norm_posn == "pre":
-            # print("pre", x.norm(), x.isnan().sum())
             x = x + self.mha(self.ln1(x))
-            # print("post mha", x.norm(), x.isnan().sum())
             x = x + self.mlp(self.ln2(x))
-            # print("post mlp", x.norm(), x.isnan().sum())
-
         else:
             raise NotImplementedError(f"Layer norm posn '{self.layer_norm_posn}' not supported.")
         return x
@@ -292,8 +278,7 @@ class Transformer(nn.Module):
 
     def forward(self, x, targets=None):
         with self.fwd_ctx:  # autocast, technically this is slightly different than doing `with fwd_ctx: model(x);`
-            _, seq_len = x.shape  # not strictly "correct" since we sort of cut sequences up so position embeddings are wrong here
-            # rprint("xdev", x.device, "proper_dev", self.device, "posn_embed", self.posn_embed.weight.device)
+            _, seq_len = x.shape  # not strictly "correct" since we sort of cut sequences up so absolute position embeddings are wrong here
             x = self.embed(x)
             if self.cfg.posn_embed_type == "base_learnable":
                 x = x + self.posn_embed(torch.arange(seq_len, device=self.device)).unsqueeze(0) # type: ignore
@@ -301,26 +286,29 @@ class Transformer(nn.Module):
                 x = x + self.posn_embed[:seq_len].unsqueeze(0) # type: ignore
 
             for i, block in enumerate(self.blocks):
-                # if i == 1:  #
-                #     return x
-                # print(i, x.shape)
-                # print(i, torch.topk(x.flatten().abs(), 5).values, x.norm()) 
                 x = block(x)  # (batch, seq_len, vec_size)
-            # print("final shape", x.shape)
-            # print("target shape", targets.shape)
             
             out = self.unembed(x)  # (batch, seq_len, vec_size) @ (vec_size, vocab_size) 
 
             if targets is None:  # ie. inference mode, return logits so we can do temperature stuff
                 return out   # F.softmax(out, dim=-1)
             else:  # flatten across batches and positions so that we can compare indices (in `targets`) to distributions (in `out`)
-                #print(out, targets)
-                #print(F.cross_entropy(out.view(-1, self.dset_cfg.vocab_size), targets.view(-1)))
                 loss = F.cross_entropy(out.reshape(-1, self.dset_cfg.vocab_size), targets.reshape(-1), label_smoothing=self.cfg.label_smoothing)
                 return out, loss
 
     @torch.no_grad()  # batched sampling
     def generate(self, encoder, prompt: Union[str, List[int], torch.Tensor], temperature=None) -> List[str]:
+        """Generates a sequence of text given a prompt. If prompt is a string, it will be encoded using the provided encoder.
+        If prompt is a list of integers, it will be used as is. If prompt is a tensor, it will be used as is. If the tensor
+        has 2 dimensions, it generates sequences for each row in the tensor. In all cases, generate tokens until 2*block_size
+        or an EOS token is generated.
+        
+        Args:
+            encoder: the encoder to use for encoding the prompt
+            prompt: the prompt to start generating from
+            temperature: the temperature to use for sampling, if None, will use the default temperature
+        Returns:
+            A list of strings, each string is a generated sequence of text."""
         self.eval()
         if temperature is None:
             temperature = self.cfg.default_temperature
@@ -373,6 +361,8 @@ class Transformer(nn.Module):
 
 
     def get_optim(self): # optim, sched, scaler
+        """Returns the optimizer, scheduler, and gradient scaler for the model. 
+        Default scheduler is linear -> cosine -> constant. Optimizer can optionally be ZeroRedundancyOptimizer if using DDP."""
         if self.cfg.weight_decay > 0:
             grad_params = [p for p in self.parameters() if p.requires_grad]
             weight_decay_params = [p for p in grad_params if p.dim() >= 2]  # matrices should be weight decayed
@@ -406,6 +396,9 @@ class Transformer(nn.Module):
         return scaler, combined_sched, optim
 
     def add_activation_checkpointing(self):
+        """Adds activation checkpointing to the model. This will checkpoint the model before each GELU and Normalizer, since
+        those layers are cheap to compute and can save a bit of memory. This is only done once, so calling this function multiple
+        times will have no effect."""
         if self.checkpointing_setup:
             return
         if self.cfg.compile:
@@ -420,6 +413,7 @@ class Transformer(nn.Module):
                     return ckpt.checkpoint(orig_forward, *inputs, preserve_rng_state=False, use_reentrant=False)
                 module.forward = checkpoint_fwd  # type: ignore
 
+        # recursively iterate through modules and apply the add_checkpointing function, which will checkpoint the specified layers
         net_utils.traverse_modules(add_checkpointing, self)  # type: ignore
         # to get model vram, you need to do looped waiting
         # for speed-wise on small, estimates were smoothed with gamma=0.999, sampled at the last step where all are available
