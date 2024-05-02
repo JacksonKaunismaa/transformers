@@ -85,6 +85,7 @@ class Resumer():
         `config` is updated in place to exactly match the config saved in the resume file, if one exists. The `exp_config` inside the 
         `net` object is also updated to reflect the resume file. 
         if `net` is set to None, all loading except for `config` based loading is skipped.
+
         Args:
             config (ExperimentCfg): the config object to update in place
             net (Transformer): the model to load state dicts onto
@@ -200,14 +201,17 @@ def get_variable_index_shifter(seq_len, device):  # could use a cache here to sa
 
 # REL_BIAS
 def get_rel_bias_indices(block_size, max_distance, num_buckets):
+    """Generates indices for relative bias embeddings. The indices are used to index into the relative bias matrix.
+     Return:
+        torch.Tensor: a tensor of indices of shape (block_size, block_size)"""
     # adapted from https://github.com/huggingface/transformers/blob/v4.30.0/src/transformers/models/t5/modeling_t5.py#L388
-    context_position = torch.arange(block_size, dtype=torch.long)[:, None]
-    memory_position = torch.arange(block_size, dtype=torch.long )[None, :]
-    relative_position = memory_position - context_position
+    context_position = torch.arange(block_size, dtype=torch.long)[:, None]  # (block_size, 1)
+    memory_position = torch.arange(block_size, dtype=torch.long )[None, :]  # (1, block_size)
+    relative_position = memory_position - context_position  # (block_size, block_size) of [[0, -1, -2, ...], [1, 0, -1, ...], ...]
 
     # elementwise minimum, basically zeroes out upper right triangle
-    relative_position = -torch.min(relative_position, torch.zeros_like(relative_position)) 
-    # now relative_position is in the range [0, inf)
+    relative_position = -torch.min(relative_position, torch.zeros_like(relative_position)) # (block_size, block_size)
+    # now relative_position is in the range [0, inf), eg. [[0, 0, 0, ...], [1, 0, 0, ...], [2, 1, 0, ...], ...]]
 
     # half of the buckets are for single increment
     max_exact = num_buckets // 2
@@ -218,7 +222,7 @@ def get_rel_bias_indices(block_size, max_distance, num_buckets):
     # but we only want to go up to position max_distance
     relative_position_if_large = max_exact + (
         torch.log(relative_position.float() / max_exact)   # ie. log(rel_posn) - log(max_exact)
-        / np.log(max_distance / max_exact)  # ie. log(max_distance) - log(max_exact) => at posn max_distance the log -> 1
+        / np.log(max_distance / max_exact)  # ie. log(max_distance) - log(max_exact) => at posn max_distance the log -> 1 in [0,1]
         * (num_buckets - max_exact)   # so that now at max_distance the log is num_buckets - max_exact
     ).long()
 
@@ -234,26 +238,43 @@ def get_rel_bias_indices(block_size, max_distance, num_buckets):
 
 
 # ROTARY
-# from https://github.com/lucidrains/rotary-embedding-torch/blob/main/rotary_embedding_torch/rotary_embedding_torch.py
+# from https://github.com/lucidrains/rotary-embedding-torch/blob/0.2.5/rotary_embedding_torch/rotary_embedding_torch.py#L78
 def get_rotary_freqs(block_size, theta, rotary_dim):
+    """Given a desired theta and rotary_dim, calculate frequencies at which to rotate them."""
     freqs = 1. / (theta ** (torch.arange(0, rotary_dim, 2)[:(rotary_dim // 2)].float() / rotary_dim))
     seq = torch.arange(block_size)
     m_freq = torch.outer(seq, freqs)
     return m_freq
 
-# from https://github.com/lucidrains/rotary-embedding-torch/blob/main/rotary_embedding_torch/rotary_embedding_torch.py#L33
+# from https://github.com/lucidrains/rotary-embedding-torch/blob/0.2.5/rotary_embedding_torch/rotary_embedding_torch.py#L33
 def rotate_half(x):
+    """Negate every other element of the last dimension of x (see equation 15 of https://arxiv.org/pdf/2104.09864)"""
     x1, x2 = rearrange(x, '... (d r) -> r ... d', r = 2)
     return rearrange([-x2, x1], 'r ... d -> ... (d r)')  # einops symmetry!
 
 
 def rotate_q_or_k(q_or_k, freqs, rot_dim):
+    """Rotate a single query or key matrix (q_or_k) given frequencies and maximum rotation dimensions rot_dim
+    Args:
+        q_or_k (torch.Tensor): the query or key matrix to rotate (batch, n_heads, seq_len, head_size)
+        freqs (torch.Tensor): the frequencies at which to rotate the matrix
+        rot_dim (int): the maximum number of dimensions to rotate
+    Returns:
+        torch.Tensor: the rotated query or key matrix (batch, n_heads, seq_len, head_size)"""
     t, t_right = q_or_k[..., :rot_dim], q_or_k[..., rot_dim:]  # will be neglibile anyway (unless they are ~0)
     t = (t * freqs.cos()) + (rotate_half(t) * freqs.sin())  # elementwise product of cos(m*theta_i), rotate each 2-subspace
     return torch.cat([t, t_right], dim=-1)   # concatenate rotated part (t) and unrotated part (t_right)
 
-# from https://github.com/lucidrains/rotary-embedding-torch/blob/main/rotary_embedding_torch/rotary_embedding_torch.py#L109
+# from https://github.com/lucidrains/rotary-embedding-torch/blob/0.2.5/rotary_embedding_torch/rotary_embedding_torch.py#L109
 def rotate_q_and_k(q, k, freqs):  # inpt is (batch, n_heads, seq_len, head_size)
+    """Rotate both the query and key matrices given frequencies. Rotating both at the same time allows us to make some very minute
+    savings in terms of indexing the freqs tensor. 
+    Args:
+        q (torch.Tensor): the query matrix to rotate (batch, n_heads, seq_len, head_size)
+        k (torch.Tensor): the key matrix to rotate  (batch, n_heads, seq_len, head_size)
+        freqs (torch.Tensor): the frequencies at which to rotate the matrices
+    Returns:
+        tuple(torch.Tensor): the rotated query matrix, and the rotated key matrix (batch, n_heads, seq_len, head_size)"""
     rot_dim = freqs.shape[-1]  # only use the first rot_dim units of embedding dimension, since effect on units past this
     freqs = freqs[:q.shape[2]]  # select up to seq_len (freqs is (seq_len, rotary_dim))
     return rotate_q_or_k(q, freqs, rot_dim), rotate_q_or_k(k, freqs, rot_dim)
@@ -263,6 +284,7 @@ def rotate_q_and_k(q, k, freqs):  # inpt is (batch, n_heads, seq_len, head_size)
 # GENERATING RANDOM SENTENCES
 # for text task, randomly samples from words in the dataset that start sentences
 def sample_random_start_word(dset):   # for generating the samples to show qualitative progress over time
+    """Find a random word to start the dataset by sampling a random token that comes after an EOS"""
     while True:  # look over all(-ish) sentence starting words in the dataset, pick one at random
         idx = np.random.randint(0, len(dset))
         random_subset = dset[idx][0]  # [0] selects x over y
@@ -273,22 +295,24 @@ def sample_random_start_word(dset):   # for generating the samples to show quali
     
 # generic sampling function, takes in a function that produces start words for each of the samples
 def generate_samples(net, dsets, start_token_func, num_samples=None, temperature=None):
+    """Given a function that finds a start_token, generate `num_samples` samples from the network."""
     if num_samples is None:
         num_samples = net.cfg.num_sample
     start_tokens = [start_token_func(dsets["eval"]) for _ in range(num_samples)]
     stacked_tokens = torch.tensor(start_tokens).unsqueeze(-1).to(net.device)  # (num_samples, 1)
-    # print("found start tokens", start_tokens, dsets["eval"].encoder.decode(start_tokens))
     return net.generate(dsets["eval"].encoder, stacked_tokens, temperature=temperature) 
 
 
-# wrapper for generate_samples that returns randomly generated sentences in a format usable for wandb logging (task == 'text')
 def wandb_sample_random_sentences(net, dsets, step):
+    """Wrapper for generate_samples that returns randomly generated sentences in a format usable for wandb 
+    logging (task == 'text')."""
     rand_sentences = [[step, sent] for sent in generate_samples(net, dsets, sample_random_start_word)]
     return {"rand_sentences": wandb.Table(columns=["step", "sentence"], data=rand_sentences)}
 
 
-# wrapper for generate_samples that returns randomly generated videos in a format usable for wandb logging (task == 'commavq')
 def wandb_sample_random_videos(net, dsets, step):
+    """Wrapper for generate_samples that returns randomly generated videos in a format usable for wandb logging 
+    (task == 'commavq')"""
     start_token_func = lambda x: dsets["eval"].encoder.bos_token
     rand_videos = [video for video in generate_samples(net, dsets, start_token_func)]
     return {f"video{i}": video for i, video in enumerate(rand_videos)}
@@ -296,6 +320,8 @@ def wandb_sample_random_videos(net, dsets, step):
 
 # ACTIVATION CHECKPOINTING (and potentially saving activations)
 def traverse_modules(func, mod):
+    """Iterate through submodules of network, appplying the passed in func() to each module. This can be used to add any hook
+    to specific layer types, but we use it for activation checkpointing."""
     has_sub_mods = False
     for sub_mod in mod.children():
         traverse_modules(func, sub_mod)

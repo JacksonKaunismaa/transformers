@@ -19,6 +19,8 @@ from . import net_utils
 
 class MLPBlock(nn.Module):
     def __init__(self, cfg):
+        """A multi-layer perceptron block. It consists of a linear layer, a GELU activation function, another
+        Linear layer and then a dropout layer."""
         super().__init__()
         self.w_1 = nn.Linear(cfg.vec_size, cfg.vec_size*4, bias=cfg.linear_bias)
         self.act_func = nn.GELU()
@@ -32,6 +34,7 @@ class MLPBlock(nn.Module):
 
 class CustomNormalizer(nn.Module):
     def __init__(self, cfg):
+        """A custom normalizer layer. Supports LayerNorm and RMSNorm."""
         super().__init__()
         self.width = cfg.vec_size
 
@@ -61,6 +64,9 @@ class CustomNormalizer(nn.Module):
 
 class MultiHeadAttention(nn.Module):
     def __init__(self, cfg: config_objects.ExperimentCfg, main_transformer: "Transformer"):
+        """A multi-head attention layer. It supports multiple different types of position embedding, flash attention, precision
+        options, and more. See config_objects.py for details. Contains a reference to the overall model in `main_transformer` so
+        that we can re-use certain buffers/parameters between layers."""
         super().__init__()
         assert cfg.vec_size % cfg.n_heads == 0
 
@@ -167,6 +173,9 @@ class MultiHeadAttention(nn.Module):
 
 class TransformerBlock(nn.Module):
     def __init__(self, cfg, main_transformer: "Transformer"):
+        """A single transformer block. This consists of a MultiHeadAttention layer followed by a MLPBlock layer. It
+        contains a reference to the overall model in `main_transformer` so that we can re-use certain 
+        buffers/parameters between layers."""
         # design pattern: never pass in parameters directly into initializing a nn.Module, always use the cfg object
         super().__init__()
         self.ln1 = CustomNormalizer(cfg)
@@ -195,6 +204,12 @@ class TransformerBlock(nn.Module):
 
 class Transformer(nn.Module):
     def __init__(self, model_cfg: config_objects.ExperimentCfg, dset_cfg: config_objects.DatasetCfg, no_init=False):
+        """The main transformer model.
+            Args:
+                model_cfg: the configuration object for the model, contains layer sizes, widths, attention options, etc.
+                dset_cfg: the configuration object for the dataset
+                no_init: if True, will not initialize the architecture of the model. Default is False.
+        """
         super().__init__()
 
         # for saving stuff purposes
@@ -206,6 +221,8 @@ class Transformer(nn.Module):
             self.initialize_architecture()  # uses saved cfg to make the layers
 
     def initialize_architecture(self):
+        """Initializes the architecture of the model. This is done in a separate function so that the model can be initialized
+        without loading the weights. Also creates any necessary buffers for the model."""
         assert self.cfg.posn_embed_type in ["base_sinusoid", "base_learnable", "relative", "none", "rel_bias", "rotary"]
 
 
@@ -221,8 +238,8 @@ class Transformer(nn.Module):
             self.register_buffer("shift_indices", 
                                  net_utils.get_index_shifter(self.cfg.block_size, self.cfg.batch_size, self.cfg.n_heads))
         elif self.cfg.posn_embed_type == "rel_bias":
-            self.rel_bias = nn.Embedding(self.cfg.block_size, self.cfg.n_heads)
-            self.register_buffer("rel_bias_indices", net_utils.get_rel_bias_indices(self.cfg.block_size,
+            self.rel_bias = nn.Embedding(self.cfg.block_size, self.cfg.n_heads)  # should be changed to cfg.rel_bias_max_posn?
+            self.register_buffer("rel_bias_indices", net_utils.get_rel_bias_indices(self.cfg.block_size,  # (block_size, block_size)
                                                                                     self.cfg.rel_bias_max_posn,
                                                                                     self.cfg.rel_bias_num_buckets))
         elif self.cfg.posn_embed_type == "base_learnable":

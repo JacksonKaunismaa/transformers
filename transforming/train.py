@@ -21,12 +21,27 @@ from .utils import rprint, oprint
 
 def run_experiment(dsets, proj_name, resume_path, exp_config: ExperimentCfg, sample_method, 
                    log_wandb=True, resume=True):
-    net = Transformer(exp_config, dsets["train"].cfg, no_init=True)
-    resumer = net_utils.Resumer(resume_path, exp_config.job_id)
+    """Runs a single training experiment. This function is the main entry point for training a model. It handles
+    all the details of setting up the model, optimizer, and scheduler, and running the training loop. It also
+    handles logging to wandb and saving checkpoints.
+    
+    Args:
+        dsets: dict of Dataset objects, containing the training and evaluation datasets
+        proj_name: str, the name of the wandb project to log to
+        resume_path: str, the path to a resume file, if resuming from a checkpoint
+        exp_config: ExperimentCfg, the configuration object for the experiment
+        sample_method: callable, a function that generates samples from the model for logging to wandb
+        log_wandb: bool, whether to log to wandb
+        resume: bool, whether to resume from a checkpoint
+    """
+    # no_init=True => don't initialize weights yet
+    # since the resume path could contain a different config, so we need to load the config from the resume file first
+    net = Transformer(exp_config, dsets["train"].cfg, no_init=True) 
+    resumer = net_utils.Resumer(resume_path, exp_config.job_id)  # creates resumer object, for saving and loading checkpoints
     resumer.load(config=exp_config)  # load config from resume file (or don't if the resume file doesn't exist)
     net.initialize_architecture()  # create layers based on updated exp_config
     
-    if log_wandb and utils.get_rank() == 0:
+    if log_wandb and utils.get_rank() == 0:  # create wandb session
         run_obj = wandb.init(project=proj_name,   # resume=True => we search for a a resume file and open it
                              id=resumer.wandb_run_id if resume else None,   # wandb_run_id is None if resume=False
                              resume="must" if resume and resumer.wandb_run_id else None,  # wandb_run_id is not None iff resume=True,
@@ -36,42 +51,21 @@ def run_experiment(dsets, proj_name, resume_path, exp_config: ExperimentCfg, sam
         # if wandb_run_id wasn't set before (either resume=False or no resume file found), set it now for sure
         resumer.wandb_run_id = run_obj.id  # type: ignore 
 
-    print("model save path is ", resumer.model_save_path, ", so be careful")
+    oprint("model save path is ", resumer.model_save_path, "")
     device_id = utils.get_local_rank() # % utils.get_world_size()  # modulus to ensure contiguous?
-    device = f"{utils.get_device_type()}:{device_id}"
-    # #rprint("setting device to", exp_config.device, net.cfg.device)
-        # os.environ["CUDA_VISIBLE_DEVICES"] = str(device_id)
-        # torch.cuda.set_device(device_id)  # so that NCCL knows we are using different devices
-    print(net)
+    device = f"{utils.get_device_type()}:{device_id}"   # get the device string for the current process
     net.to(device)
-    # #rprint("setting device to", exp_config.device, net.cfg.device)
 
     if exp_config.compile:  # should do compile after DDP due to extra optimizations that can be applied
-        print("Compiling model...")  # in practice, its slower though
+        rprint("Compiling model...")  # in practice, its slower though
         net = torch.compile(net)
 
     if exp_config.ddp:
         rprint("worker", utils.get_rank(), "has", device_id, "World size is ", utils.get_world_size(), "dev_cnt",
-            torch.cuda.device_count(), "dev_id", device_id, device, "localr", utils.get_local_rank(),
-            os.environ["MASTER_ADDR"], os.environ["MASTER_PORT"], "bad")
+            torch.cuda.device_count(), "dev_id", device_id, device, "local_rank", utils.get_local_rank(), ", connected to:"
+            os.environ["MASTER_ADDR"], os.environ["MASTER_PORT"])
         net = DDP(net, device_ids=[device_id], output_device=device_id)
-    
 
-
-        # [print(utils.get_local_rank(), torch.cuda.memory_summary(n)) for n in range(torch.cuda.device_count())]
-
-    # with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
-    #     with record_function("model"):
-    #         for i, sample in enumerate(dsets["train"].dataloader()):
-    #             # print(utils.get_rank(), "has", sample[0][0])
-    #             x,y = [el.to(net.device, non_blocking=True) for el in sample]
-    #             net(x, y)
-    #             if i > 50:
-    #                 break
-    # print(prof.key_averages(group_by_input_shape=True).table(sort_by="self_cpu_time_total", row_limit=10))
-    # return
-
-    # #rprint("setting device to", exp_config.device, net.cfg.device)
     scaler, sched, optim = utils.get_raw(net).get_optim()  # type:ignore
 
     if resume:
@@ -84,24 +78,11 @@ def run_experiment(dsets, proj_name, resume_path, exp_config: ExperimentCfg, sam
         for gr in optim.param_groups:  # if the config loaded from the resume file changes the weight decay, update it
             if gr['weight_decay'] > 0:
                 gr['weight_decay'] = exp_config.weight_decay
-    # #rprint("setting device to", exp_config.device, net.cfg.device)
 
     rprint("weight decays", [gr['weight_decay'] for gr in optim.param_groups if 'weight_decay' in gr])
-    if utils.get_rank() == 0:
-        print("Config is:", exp_config)
+    oprint("Config is:", exp_config)
 
-    # loss_res = {"eval":[]}
-    # utils.barrier()
-    # start_time = utils.get_time()
-    # evaluate(net, dsets, exp_config, loss_res)
-    # print(loss_res, utils.get_time() - start_time, utils.get_rank())
-    # dist.destroy_process_group()
-    # return
-    # print("waititng to log network params alone")
-    # for _ in range(180):
-    #     time.sleep(1)
-    # print("done logging network params usage alon")
-
+    # do the actual training
     train_result = train(net, resumer, scaler, sched, optim, exp_config, dsets, log_wandb, sample_method)
     
     if log_wandb and utils.get_rank() == 0:
@@ -114,6 +95,23 @@ def run_experiment(dsets, proj_name, resume_path, exp_config: ExperimentCfg, sam
 
 
 def train(net, resumer, scaler, scheduler, optimizer, exp_config: ExperimentCfg, dsets, log_wandb, sample_method):
+    """Runs the training loop for a single experiment. This function is responsible for running the training loop,
+    evaluating the model, logging to wandb, and saving checkpoints. It also handles the logic for early stopping based
+    on the best loss.
+    
+    Args:
+        net: Transformer, the model to train
+        resumer: Resumer, the object for saving and loading checkpoints
+        scaler: GradScaler, the gradient scaler
+        scheduler: Scheduler, the learning rate scheduler
+        optimizer: Optimizer, the optimizer
+        exp_config: ExperimentCfg, the configuration object for the experiment
+        dsets: dict of Dataset objects, containing the training and evaluation datasets (eg. {'train': Dataset, 'eval': Dataset})
+        log_wandb: bool, whether to log to wandb
+        sample_method: callable, a function that generates samples from the model for logging to wandb
+    Returns:
+        dict of {metric_name: {split: [metric_values]}}: the metrics for the training run
+    """
     # TODO: consider changing this weird iterated dictionary thing into something clearer
     # maybe another class or only track the current epoch and do it with a {"loss", "perp", "accu"}
     # then you don't have to compute "shortened" names, the code is simpler. Another option is to 
@@ -137,51 +135,31 @@ def train(net, resumer, scaler, scheduler, optimizer, exp_config: ExperimentCfg,
     while (curr_iter := scheduler.last_epoch) < exp_config.total_steps:
         start = utils.get_time()
         # rprint("after starting time", start, "mem alloc", torch.cuda.memory_summary())
-        for s in trange(exp_config.train_steps):
+        for s in trange(exp_config.train_steps): # tqdm + range
 
             for i in range(grad_accum_steps):  # compute gradients for a single macro-batch
                 sample = next(tr_loader)  # TODO: maybe move getting the next sample to after the forward pass, to overlap better
-                # if s == 0 and i == 0:
-                #     rprint("after next(tr_loader)", torch.cuda.memory_summary())
+                
                 if isinstance(sample, dict):  # handle commavq dataset
                     sample = sample['xy'].transpose(0,1)  # switch batch and x vs. y dimension
-                # if s == 0 and i == 0:
-                #     rprint("after sample[xy].transpose", torch.cuda.memory_summary()) 
+                
                 x,y = [el.to(net.device, non_blocking=True) for el in sample]
-                # if s == 0 and i == 0:
-                #     rprint("after x,y.cuda", torch.cuda.memory_summary())
+                
                 if exp_config.ddp:   # only bother doing sync when doing the very last .backward() before an optimizer step
                     net.require_backward_grad_sync = ((i+1) % grad_accum_steps == 0)
-                batch_loss = net(x, y)[1] / grad_accum_steps  # net returns (loss_value, logits) tuple
-                # if s == 0 and i == 0:
-                #     rprint("after net(x,y)", torch.cuda.memory_summary())
+                batch_loss = net(x, y)[1] / grad_accum_steps  # net returns (logits, loss_value) tuple
+                
                 scaler.scale(batch_loss).backward()  # accumulate scaled gradients
-                # if s == 0 and i == 0:
-                #     rprint("after .backward(loss)", torch.cuda.memory_summary())
-
+                
             scaler.unscale_(optimizer)  # unscale so that we can clip propely
-            # if s == 0:
-            #     rprint("after scale.unscale(optim)", torch.cuda.memory_summary())
-            torch.nn.utils.clip_grad_norm_(net.parameters(), exp_config.grad_clip)  # type: ignore
-            # if s == 0:
-            #     rprint("after clip grad", torch.cuda.memory_summary())
-            scaler.step(optimizer)  # already gradients are unscaled (as they should be), this won't double unscale them
-            # if s == 0:
-            #     rprint("after scaler.step", torch.cuda.memory_summary())
+            torch.nn.utils.clip_grad_norm_(net.parameters(), exp_config.grad_clip) # clip gradients
+            scaler.step(optimizer)  # step otimizer and scaler with unscaled gradients
             scaler.update()  # update scale parameter
-            # if s == 0:
-            #     rprint("after scaler.update", torch.cuda.memory_summary())
-            optimizer.zero_grad(set_to_none=True)  # supposedly better on memory
-            # if s == 0:
-            #     rprint("after optim.zero_grad", torch.cuda.memory_summary())
+            optimizer.zero_grad(set_to_none=True)  # supposedly better on memory than .zero_grad()
             scheduler.step()  # update LR
-            # if s == 0:
-            #     rprint("after scheduler.step", torch.cuda.memory_summary())
 
         epoch_time = utils.get_time() - start
-        # rprint("after utils.get_time", torch.cuda.memory_summary())
         metrics.evaluate(net, dsets, exp_config, all_metrics)
-        # rprint("after .evaluate", torch.cuda.memory_summary())
         curr_iter = scheduler.last_epoch
         short_name_metrics = {f"{split[:2]}_{metric_name[:4]}": result[-1]  # shorten names of metrics for pretty printing
                               for metric_name,results in all_metrics.items()  # read as an nested for-loop with the
@@ -197,24 +175,14 @@ def train(net, resumer, scaler, scheduler, optimizer, exp_config: ExperimentCfg,
                            "step": curr_iter
                         })
             print(epoch_summary)
-        # rprint("after wandb.log", torch.cuda.memory_summary())
         rprint("checking whether to save, best was", non_ddp_net.best_loss, "last loss was", all_metrics["loss"]["eval"][-1])
         if all_metrics["loss"]["eval"][-1] < non_ddp_net.best_loss or np.isnan(all_metrics["loss"]["eval"][-1]):  
             non_ddp_net.best_loss = all_metrics["loss"]["eval"][-1]
             rprint("updating best loss to", non_ddp_net.best_loss)
-            # if utils.get_rank() == 0:  # put rank check here so that all ranks have consistent .best_loss
+            # update best loss so that all ranks have consistent .best_loss (and have a consistent view of when to save)
             # need to disable the rank check here since sharded optimizer requires all ranks to consolidate
             resumer.save(net=non_ddp_net, scaler=scaler, optim=optimizer, sched=scheduler)
-            # rprint("after .save", torch.cuda.memory_summary())
-
-            # non_ddp_net.save_model_state_dict(scaler=scaler, optim=optimizer, sched=scheduler)
-            # ie. save the nan model, but stop training
-            if np.isnan(all_metrics["loss"]["eval"][-1]):  # type: ignore
-                print("detected nan failure, aborting training...")
-                return
-                # utils.barrier()  # wrapper around dist.barrier() that is a no-op if no ddp
                 
-            
     return all_metrics
 
 

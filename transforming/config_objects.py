@@ -26,8 +26,8 @@ class ExperimentCfg:
     # Position embedding stuff
     posn_embed_type: str = "base"  # must be in ['base_sinusoid', 'base_learnable', 'relative', 'none', 'rel_bias', 'rotary']
     # rel_bias: https://arxiv.org/pdf/1910.10683
-    rel_bias_max_posn: int = 128  # only has effect if posn_embed_type == "rel_bias"
-    rel_bias_num_buckets: int = 32  # only has effect if posn_embed_type == "rel_bias"
+    rel_bias_max_posn: int = 128  # only has effect if posn_embed_type == "rel_bias", everything past max_posn is given the same embed
+    rel_bias_num_buckets: int = 32  # only has effect if posn_embed_type == "rel_bias", num of log-buckets to split relative distance 
     # relative: https://arxiv.org/pdf/1901.02860v3
     relative_float32_attn: bool = False  # if posn_embed_type =="relative", force float32 in relative_posn attention computation
     # rotary: https://arxiv.org/pdf/2104.09864
